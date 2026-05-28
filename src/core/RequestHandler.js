@@ -24,13 +24,14 @@ const TIMEOUTS = {
 };
 
 class RequestHandler {
-    constructor(serverSystem, connectionRegistry, logger, browserManager, config, authSource) {
+    constructor(serverSystem, connectionRegistry, logger, browserManager, config, authSource, accountScheduler = null) {
         this.serverSystem = serverSystem;
         this.connectionRegistry = connectionRegistry;
         this.logger = logger;
         this.browserManager = browserManager;
         this.config = config;
         this.authSource = authSource;
+        this.accountScheduler = accountScheduler;
 
         // Initialize sub-modules
         this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
@@ -458,12 +459,13 @@ class RequestHandler {
      * @param {number} timeoutMs - Maximum time to wait in milliseconds
      * @returns {Promise<boolean>} true if connection established, false if timeout
      */
-    async _waitForConnection(timeoutMs = 10000) {
+    async _waitForConnection(timeoutMs = 10000, authIndex = null) {
+        const targetAuthIndex = authIndex !== null ? authIndex : this.currentAuthIndex;
         const startTime = Date.now();
         const checkInterval = 200; // Check every 200ms
 
         while (Date.now() - startTime < timeoutMs) {
-            const connection = this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex);
+            const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
             // Check both existence and readyState (1 = OPEN)
             if (connection && connection.readyState === 1) {
                 return true;
@@ -472,15 +474,15 @@ class RequestHandler {
         }
 
         this.logger.warn(
-            `[Request] Timeout waiting for WebSocket connection for account #${this.currentAuthIndex}. Closing unresponsive context...`
+            `[Request] Timeout waiting for WebSocket connection for account #${targetAuthIndex}. Closing unresponsive context...`
         );
         // Proactively close the unresponsive context so subsequent attempts re-initialize it
         if (this.browserManager) {
             try {
-                await this.browserManager.closeContext(this.currentAuthIndex);
+                await this.browserManager.closeContext(targetAuthIndex);
             } catch (e) {
                 this.logger.warn(
-                    `[System] Failed to close unresponsive context for account #${this.currentAuthIndex}: ${e.message}`
+                    `[System] Failed to close unresponsive context for account #${targetAuthIndex}: ${e.message}`
                 );
             }
         }
@@ -514,27 +516,27 @@ class RequestHandler {
         return false;
     }
 
-    async _waitForSystemAndConnectionIfBusy(res = null, options = {}) {
-        if (!this.authSwitcher.isSystemBusy) {
-            return true;
-        }
+    async _waitForSystemAndConnectionIfBusy(res = null, options = {}, authIndex = null) {
+        const targetAuthIndex = authIndex !== null ? authIndex : this.currentAuthIndex;
 
         const {
             busyMessage = "Server undergoing internal maintenance (account switching/recovery), please try again later.",
-            connectionMessage = "Service temporarily unavailable: Connection not established after switching.",
+            connectionMessage = "Service temporarily unavailable: Connection not established.",
             connectionTimeoutMs = WS_CONNECTION_READY_TIMEOUT_MS,
             onConnectionTimeout,
             sendError = res ? (status, message) => this._sendErrorResponse(res, status, message) : () => {},
         } = options;
 
-        const ready = await this._waitForSystemReady();
-        if (!ready) {
-            sendError(503, busyMessage);
-            return false;
+        if (this.authSwitcher.isSystemBusy) {
+            const ready = await this._waitForSystemReady();
+            if (!ready) {
+                sendError(503, busyMessage);
+                return false;
+            }
         }
 
-        if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-            const connectionReady = await this._waitForConnection(connectionTimeoutMs);
+        if (!this.connectionRegistry.getConnectionByAuth(targetAuthIndex)) {
+            const connectionReady = await this._waitForConnection(connectionTimeoutMs, targetAuthIndex);
             if (!connectionReady) {
                 if (typeof onConnectionTimeout === "function") {
                     try {
@@ -753,49 +755,35 @@ class RequestHandler {
         });
         res.__proxyResponseStreamMode = null;
 
+        let allocatedAuthIndex = null;
         try {
+            if (this.accountScheduler) {
+                allocatedAuthIndex = await this.accountScheduler.acquireAccount();
+            } else {
+                allocatedAuthIndex = this.currentAuthIndex;
+            }
+
             // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
+            if (!this.connectionRegistry.getConnectionByAuth(allocatedAuthIndex)) {
+                this.logger.warn(`[Request] No WebSocket connection for account #${allocatedAuthIndex}`);
+                // Wait for system to become ready
+                const ready = await this._waitForSystemAndConnectionIfBusy(res, {}, allocatedAuthIndex);
+                if (!ready) {
+                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
+                    if (this.accountScheduler && allocatedAuthIndex !== null) {
+                        this.accountScheduler.releaseAccount(allocatedAuthIndex, 503);
+                    }
                     return;
                 }
             }
 
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
             if (this.browserManager) {
                 this.browserManager.notifyUserActivity();
             }
-            // Handle usage-based account switching
+
             const isGenerativeRequest =
                 req.method === "POST" &&
                 (req.path.includes("generateContent") || req.path.includes("streamGenerateContent"));
-
-            if (isGenerativeRequest) {
-                const usageCount = this.authSwitcher.incrementUsageCount();
-                if (usageCount > 0) {
-                    const rotationCountText =
-                        this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                    this.logger.info(
-                        `[Request] Generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
-                    );
-                    if (this.authSwitcher.shouldSwitchByUsage()) {
-                        this.needsSwitchingAfterRequest = true;
-                    }
-                }
-            }
 
             const proxyRequest = this._buildProxyRequest(req, requestId);
             proxyRequest.is_generative = isGenerativeRequest;
@@ -815,46 +803,95 @@ class RequestHandler {
                 streamMode: wantsStream ? proxyRequest.streaming_mode : null,
             });
 
+            let finalStatus = 200;
             try {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    allocatedAuthIndex,
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
 
                 if (wantsStream) {
                     this.logger.info(
-                        `[Request] Client enabled streaming (${proxyRequest.streaming_mode}), entering streaming processing mode...`
+                        `[Request] Client enabled streaming (${proxyRequest.streaming_mode}) for account #${allocatedAuthIndex}, entering streaming processing mode...`
                     );
                     if (proxyRequest.streaming_mode === "fake") {
                         await this._handlePseudoStreamResponse(proxyRequest, messageQueue, req, res);
                     } else {
-                        await this._handleRealStreamResponse(proxyRequest, messageQueue, req, res);
+                        // Pass specific authIndex to helper
+                        this.logger.info(`[Request] Dispatching stream request #${requestId} to account #${allocatedAuthIndex}`);
+                        this._getUsageStatsService()?.recordAttempt(
+                            proxyRequest.request_id,
+                            allocatedAuthIndex,
+                            this._getAccountNameForIndex(allocatedAuthIndex)
+                        );
+                        this._forwardRequest(proxyRequest, allocatedAuthIndex);
+                        const headerMessage = await messageQueue.dequeue();
+                        const headerStatus = Number(headerMessage?.status);
+                        
+                        if (headerMessage.event_type === "error") {
+                            finalStatus = headerStatus || 500;
+                            this._logFinalRequestFailure(headerMessage, "Gemini real stream");
+                            this._sendErrorResponse(res, finalStatus, headerMessage.message);
+                        } else {
+                            // Process real stream packets
+                            let isEnded = false;
+                            while (!isEnded) {
+                                const msg = await messageQueue.dequeue();
+                                if (msg.event_type === "chunk") {
+                                    this._logGeminiNativeChunkDebug(msg.data);
+                                    if (this._isResponseWritable(res)) {
+                                        res.write(msg.data);
+                                    }
+                                } else if (msg.type === "STREAM_END") {
+                                    isEnded = true;
+                                } else if (msg.event_type === "error") {
+                                    finalStatus = Number(msg.status) || 500;
+                                    this._handleRealStreamQueueClosedError(msg, res, "gemini");
+                                    isEnded = true;
+                                }
+                            }
+                        }
                     }
                 } else {
                     proxyRequest.streaming_mode = "fake";
-                    await this._handleNonStreamResponse(proxyRequest, messageQueue, req, res);
+                    // Non-stream handler bypass with manual queue wait
+                    this.logger.info(`[Request] Dispatching non-stream request #${requestId} to account #${allocatedAuthIndex}`);
+                    this._getUsageStatsService()?.recordAttempt(
+                        proxyRequest.request_id,
+                        allocatedAuthIndex,
+                        this._getAccountNameForIndex(allocatedAuthIndex)
+                    );
+                    this._forwardRequest(proxyRequest, allocatedAuthIndex);
+                    const responseMessage = await messageQueue.dequeue();
+                    
+                    if (responseMessage.event_type === "error") {
+                        finalStatus = Number(responseMessage.status) || 500;
+                        this._sendErrorResponse(res, finalStatus, responseMessage.message);
+                    } else if (responseMessage.event_type === "response") {
+                        if (this._isResponseWritable(res)) {
+                            this._setResponseHeaders(res, responseMessage.headers);
+                            res.status(responseMessage.status || 200);
+                            res.send(responseMessage.body);
+                        }
+                    }
                 }
             } catch (error) {
-                // Handle queue timeout by notifying browser
+                finalStatus = Number(error.status) || 500;
                 this._handleQueueTimeout(error, requestId);
-
                 this._handleRequestError(error, res, "gemini");
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
-                    this.logger.info(
-                        `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
-                    );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
-                        this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
-                    });
-                    this.needsSwitchingAfterRequest = false;
+                if (this.accountScheduler && allocatedAuthIndex !== null) {
+                    this.accountScheduler.releaseAccount(allocatedAuthIndex, finalStatus);
                 }
                 if (!res.writableEnded) res.end();
             }
+        } catch (schedulerErr) {
+            this.logger.error(`[Request] Scheduling error: ${schedulerErr.message}`);
+            this._sendErrorResponse(res, 503, schedulerErr.message);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -871,25 +908,23 @@ class RequestHandler {
             streamMode: null,
         });
 
+        let allocatedAuthIndex = null;
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Upload] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
+            if (this.accountScheduler) {
+                allocatedAuthIndex = await this.accountScheduler.acquireAccount();
+            } else {
+                allocatedAuthIndex = this.currentAuthIndex;
             }
 
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
+            // Check current account's browser connection
+            if (!this.connectionRegistry.getConnectionByAuth(allocatedAuthIndex)) {
+                this.logger.warn(`[Upload] No WebSocket connection for account #${allocatedAuthIndex}`);
+                const ready = await this._waitForSystemAndConnectionIfBusy(res, {}, allocatedAuthIndex);
                 if (!ready) {
                     this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
+                    if (this.accountScheduler && allocatedAuthIndex !== null) {
+                        this.accountScheduler.releaseAccount(allocatedAuthIndex, 503);
+                    }
                     return;
                 }
             }
@@ -913,22 +948,43 @@ class RequestHandler {
                 path: proxyRequest.path,
             });
 
+            let finalStatus = 200;
             try {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    allocatedAuthIndex,
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
 
-                await this._handleNonStreamResponse(proxyRequest, messageQueue, req, res);
+                this.logger.info(`[Upload] Dispatching upload request #${requestId} to account #${allocatedAuthIndex}`);
+                this._forwardRequest(proxyRequest, allocatedAuthIndex);
+                const responseMessage = await messageQueue.dequeue();
+                
+                if (responseMessage.event_type === "error") {
+                    finalStatus = Number(responseMessage.status) || 500;
+                    this._sendErrorResponse(res, finalStatus, responseMessage.message);
+                } else if (responseMessage.event_type === "response") {
+                    if (this._isResponseWritable(res)) {
+                        this._setResponseHeaders(res, responseMessage.headers);
+                        res.status(responseMessage.status || 200);
+                        res.send(responseMessage.body);
+                    }
+                }
             } catch (error) {
+                finalStatus = Number(error.status) || 500;
                 this._handleRequestError(error, res);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
+                if (this.accountScheduler && allocatedAuthIndex !== null) {
+                    this.accountScheduler.releaseAccount(allocatedAuthIndex, finalStatus);
+                }
                 if (!res.writableEnded) res.end();
             }
+        } catch (schedulerErr) {
+            this.logger.error(`[Upload] Scheduling error: ${schedulerErr.message}`);
+            this._sendErrorResponse(res, 503, schedulerErr.message);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -945,47 +1001,33 @@ class RequestHandler {
         });
         res.__proxyResponseStreamMode = null;
 
+        let allocatedAuthIndex = null;
         try {
+            if (this.accountScheduler) {
+                allocatedAuthIndex = await this.accountScheduler.acquireAccount();
+            } else {
+                allocatedAuthIndex = this.currentAuthIndex;
+            }
+
             // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
+            if (!this.connectionRegistry.getConnectionByAuth(allocatedAuthIndex)) {
+                this.logger.warn(`[Request] No WebSocket connection for account #${allocatedAuthIndex}`);
+                const ready = await this._waitForSystemAndConnectionIfBusy(res, {}, allocatedAuthIndex);
+                if (!ready) {
+                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
+                    if (this.accountScheduler && allocatedAuthIndex !== null) {
+                        this.accountScheduler.releaseAccount(allocatedAuthIndex, 503);
+                    }
                     return;
                 }
             }
 
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
             if (this.browserManager) {
                 this.browserManager.notifyUserActivity();
             }
 
             const isOpenAIStream = req.body.stream === true;
             const systemStreamMode = this.serverSystem.streamingMode;
-
-            // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
-            if (usageCount > 0) {
-                const rotationCountText =
-                    this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                this.logger.info(
-                    `[Request] OpenAI generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
-                );
-                if (this.authSwitcher.shouldSwitchByUsage()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
-            }
 
             // Translate OpenAI format to Google format (also handles model name suffix parsing)
             let googleBody, model, modelStreamingMode;
@@ -996,6 +1038,9 @@ class RequestHandler {
                 modelStreamingMode = result.modelStreamingMode || null;
             } catch (error) {
                 this.logger.error(`[Adapter] OpenAI request translation failed: ${error.message}`);
+                if (this.accountScheduler && allocatedAuthIndex !== null) {
+                    this.accountScheduler.releaseAccount(allocatedAuthIndex, 400);
+                }
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.");
             }
 
@@ -1022,11 +1067,12 @@ class RequestHandler {
                 ...(isOpenAIStream ? { streamMode: useRealStream ? "real" : "fake" } : {}),
             });
 
+            let finalStatus = 200;
             try {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    allocatedAuthIndex,
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -1034,82 +1080,19 @@ class RequestHandler {
                 if (useRealStream) {
                     let currentQueue = messageQueue;
                     let initialMessage;
-                    let skipFinalFailureSwitch = false;
-                    const immediateSwitchTracker = this._createImmediateSwitchTracker();
-
-                    // eslint-disable-next-line no-constant-condition
-                    while (true) {
-                        this._getUsageStatsService()?.recordAttempt(
-                            proxyRequest.request_id,
-                            this.currentAuthIndex,
-                            this._getAccountNameForIndex(this.currentAuthIndex)
-                        );
-                        this._forwardRequest(proxyRequest);
-                        initialMessage = await currentQueue.dequeue();
-
-                        const initialStatus = Number(initialMessage?.status);
-                        if (
-                            initialMessage.event_type === "error" &&
-                            !isUserAbortedError(initialMessage) &&
-                            Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
-                        ) {
-                            this.logger.warn(
-                                `[Request] OpenAI real stream received ${initialStatus}, switching account and retrying...`
-                            );
-                            const switched = await this._performImmediateSwitchRetry(
-                                initialMessage,
-                                requestId,
-                                immediateSwitchTracker
-                            );
-                            if (!switched) {
-                                skipFinalFailureSwitch = true;
-                                break;
-                            }
-
-                            try {
-                                currentQueue.close("retry_after_429");
-                            } catch {
-                                /* empty */
-                            }
-                            this._advanceProxyRequestAttempt(proxyRequest);
-                            currentQueue = this.connectionRegistry.createMessageQueue(
-                                requestId,
-                                this.currentAuthIndex,
-                                proxyRequest.request_attempt_id
-                            );
-                            continue;
-                        }
-
-                        break;
-                    }
+                    this._getUsageStatsService()?.recordAttempt(
+                        proxyRequest.request_id,
+                        allocatedAuthIndex,
+                        this._getAccountNameForIndex(allocatedAuthIndex)
+                    );
+                    this._forwardRequest(proxyRequest, allocatedAuthIndex);
+                    initialMessage = await currentQueue.dequeue();
 
                     if (initialMessage.event_type === "error") {
+                        finalStatus = Number(initialMessage.status) || 500;
                         this._logFinalRequestFailure(initialMessage, "OpenAI real stream");
-
-                        // Send standard HTTP error response
-                        this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message);
-
-                        // Avoid switching account if the error is just a connection reset
-                        if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
-                        } else if (skipFinalFailureSwitch) {
-                            this.logger.info(
-                                "[Request] Immediate-switch retries exhausted, skipping additional account switch."
-                            );
-                        } else {
-                            this.logger.info(
-                                "[Request] Failure due to connection reset (Real Stream), skipping account switch."
-                            );
-                        }
+                        this._sendErrorResponse(res, finalStatus, initialMessage.message);
                         return;
-                    }
-
-                    if (this.authSwitcher.failureCount > 0) {
-                        this.logger.debug(
-                            `✅ [Auth] OpenAI interface request successful - failure count reset from ${this.authSwitcher.failureCount} to 0`
-                        );
-                        this.authSwitcher.failureCount = 0;
                     }
 
                     res.status(200).set({
@@ -1117,11 +1100,10 @@ class RequestHandler {
                         Connection: "keep-alive",
                         "Content-Type": "text/event-stream",
                     });
-                    this.logger.info(`[Request] OpenAI streaming response (Real Mode) started...`);
+                    this.logger.info(`[Request] OpenAI streaming response (Real Mode) started on account #${allocatedAuthIndex}...`);
                     await this._streamOpenAIResponse(currentQueue, res, model);
                 } else {
                     // OpenAI Fake Stream / Non-Stream mode
-                    // Set up keep-alive timer for fake stream mode to prevent client timeout
                     let connectionMaintainer;
                     if (isOpenAIStream) {
                         const scheduleNextKeepAlive = () => {
@@ -1144,46 +1126,22 @@ class RequestHandler {
                     }
 
                     try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
-
-                        if (!result.success) {
-                            this._logFinalRequestFailure(result.error, "OpenAI fake/non-stream");
-                            // Send standard HTTP error response for both streaming and non-streaming
+                        this._getUsageStatsService()?.recordAttempt(
+                            proxyRequest.request_id,
+                            allocatedAuthIndex,
+                            this._getAccountNameForIndex(allocatedAuthIndex)
+                        );
+                        this._forwardRequest(proxyRequest, allocatedAuthIndex);
+                        const initialMessage = await messageQueue.dequeue();
+                        
+                        if (initialMessage.event_type === "error") {
+                            finalStatus = Number(initialMessage.status) || 500;
                             if (connectionMaintainer) clearTimeout(connectionMaintainer);
-                            if (isOpenAIStream && res.headersSent) {
-                                // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
-                                this._handleRequestError(result.error, res, "openai");
-                            } else {
-                                this._sendErrorResponse(res, result.error.status || 500, result.error.message);
-                            }
-
-                            // Avoid switching account if the error is just a connection reset
-                            if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
-                            } else if (result.error.skipAccountSwitch) {
-                                this.logger.info(
-                                    "[Request] Immediate-switch retries exhausted, skipping additional account switch."
-                                );
-                            } else {
-                                this.logger.info(
-                                    "[Request] Failure due to connection reset (OpenAI), skipping account switch."
-                                );
-                            }
+                            this._sendErrorResponse(res, finalStatus, initialMessage.message);
                             return;
                         }
 
-                        if (this.authSwitcher.failureCount > 0) {
-                            this.logger.debug(
-                                `✅ [Auth] OpenAI interface request successful - failure count reset to 0`
-                            );
-                            this.authSwitcher.failureCount = 0;
-                        }
-
-                        // Use the queue that successfully received the initial message
-                        const activeQueue = result.queue;
-
                         if (isOpenAIStream) {
-                            // Fake stream - ensure headers are set before sending data
                             if (!res.headersSent) {
                                 res.status(200).set({
                                     "Cache-Control": "no-cache",
@@ -1191,16 +1149,14 @@ class RequestHandler {
                                     "Content-Type": "text/event-stream",
                                 });
                             }
-                            // Clear keep-alive timer as we are about to send real data
                             if (connectionMaintainer) clearTimeout(connectionMaintainer);
 
                             this.logger.info(`[Request] OpenAI streaming response (Fake Mode) started...`);
                             let fullBody = "";
                             let hadStreamError = false;
                             try {
-                                // eslint-disable-next-line no-constant-condition
                                 while (true) {
-                                    const message = await activeQueue.dequeue(this.timeouts.FAKE_STREAM);
+                                    const message = await messageQueue.dequeue(this.timeouts.FAKE_STREAM);
                                     if (message.type === "STREAM_END") {
                                         break;
                                     }
@@ -1211,7 +1167,6 @@ class RequestHandler {
                                         );
                                         this._markTrackedResponseError(res, message.message, 500);
                                         hadStreamError = true;
-                                        // Check if response is still writable before attempting to write
                                         if (this._isResponseWritable(res)) {
                                             try {
                                                 res.write(
@@ -1229,7 +1184,6 @@ class RequestHandler {
                                     if (message.data) fullBody += message.data;
                                 }
                                 if (hadStreamError) {
-                                    // Backend errored; don't attempt to translate/send a "normal" stream afterwards.
                                     return;
                                 }
                                 const streamState = {};
@@ -1249,42 +1203,46 @@ class RequestHandler {
                                             `[Request] Failed to write final fake OpenAI stream chunks: ${writeError.message}`
                                         );
                                     }
-                                } else {
-                                    this.logger.debug(
-                                        "[Request] Response no longer writable before final fake OpenAI stream chunks."
-                                    );
                                 }
                                 this.logger.info("[Request] Fake mode: Complete content sent at once.");
                             } catch (error) {
-                                // Classify error type and send appropriate response
+                                finalStatus = Number(error.status) || 500;
                                 this._handleFakeStreamError(error, res, "openai");
                             }
                         } else {
                             // Non-stream
-                            await this._sendOpenAINonStreamResponse(activeQueue, res, model);
+                            if (connectionMaintainer) clearTimeout(connectionMaintainer);
+                            if (this._isResponseWritable(res)) {
+                                const responseDefaults = {
+                                    created: Math.floor(Date.now() / 1000),
+                                    model,
+                                    object: "chat.completion",
+                                };
+                                const translatedResponse = this.formatConverter.translateGoogleToOpenAI(
+                                    initialMessage.body,
+                                    responseDefaults
+                                );
+                                res.status(initialMessage.status || 200).json(translatedResponse);
+                            }
                         }
                     } finally {
                         if (connectionMaintainer) clearTimeout(connectionMaintainer);
                     }
                 }
             } catch (error) {
-                // Handle queue timeout by notifying browser
+                finalStatus = Number(error.status) || 500;
                 this._handleQueueTimeout(error, requestId);
-
                 this._handleRequestError(error, res);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
-                    this.logger.info(
-                        `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
-                    );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
-                        this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
-                    });
-                    this.needsSwitchingAfterRequest = false;
+                if (this.accountScheduler && allocatedAuthIndex !== null) {
+                    this.accountScheduler.releaseAccount(allocatedAuthIndex, finalStatus);
                 }
                 if (!res.writableEnded) res.end();
             }
+        } catch (schedulerErr) {
+            this.logger.error(`[Request] Scheduling error: ${schedulerErr.message}`);
+            this._sendErrorResponse(res, 503, schedulerErr.message);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -1724,28 +1682,26 @@ class RequestHandler {
         });
         res.__proxyResponseStreamMode = null;
 
+        let allocatedAuthIndex = null;
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
+            if (this.accountScheduler) {
+                allocatedAuthIndex = await this.accountScheduler.acquireAccount();
+            } else {
+                allocatedAuthIndex = this.currentAuthIndex;
             }
 
-            // Wait for system to become ready if it's busy
-            {
+            // Check current account's browser connection
+            if (!this.connectionRegistry.getConnectionByAuth(allocatedAuthIndex)) {
+                this.logger.warn(`[Request] No WebSocket connection for account #${allocatedAuthIndex}`);
                 const ready = await this._waitForSystemAndConnectionIfBusy(res, {
                     sendError: (status, message) =>
                         this._sendClaudeErrorResponse(res, status, "overloaded_error", message),
-                });
+                }, allocatedAuthIndex);
                 if (!ready) {
                     this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
+                    if (this.accountScheduler && allocatedAuthIndex !== null) {
+                        this.accountScheduler.releaseAccount(allocatedAuthIndex, 503);
+                    }
                     return;
                 }
             }
@@ -1757,19 +1713,6 @@ class RequestHandler {
             const isClaudeStream = req.body.stream === true;
             const systemStreamMode = this.serverSystem.streamingMode;
 
-            // Handle usage counting
-            const usageCount = this.authSwitcher.incrementUsageCount();
-            if (usageCount > 0) {
-                const rotationCountText =
-                    this.config.switchOnUses > 0 ? `${usageCount}/${this.config.switchOnUses}` : `${usageCount}`;
-                this.logger.info(
-                    `[Request] Claude generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
-                );
-                if (this.authSwitcher.shouldSwitchByUsage()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
-            }
-
             // Translate Claude format to Google format
             let googleBody, model, modelStreamingMode;
             try {
@@ -1779,6 +1722,9 @@ class RequestHandler {
                 modelStreamingMode = result.modelStreamingMode || null;
             } catch (error) {
                 this.logger.error(`[Adapter] Claude request translation failed: ${error.message}`);
+                if (this.accountScheduler && allocatedAuthIndex !== null) {
+                    this.accountScheduler.releaseAccount(allocatedAuthIndex, 400);
+                }
                 return this._sendClaudeErrorResponse(
                     res,
                     400,
@@ -1811,11 +1757,12 @@ class RequestHandler {
                 ...(isClaudeStream ? { streamMode: useRealStream ? "real" : "fake" } : {}),
             });
 
+            let finalStatus = 200;
             try {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    allocatedAuthIndex,
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -1823,77 +1770,24 @@ class RequestHandler {
                 if (useRealStream) {
                     let currentQueue = messageQueue;
                     let initialMessage;
-                    let skipFinalFailureSwitch = false;
-                    const immediateSwitchTracker = this._createImmediateSwitchTracker();
-
-                    // eslint-disable-next-line no-constant-condition
-                    while (true) {
-                        this._getUsageStatsService()?.recordAttempt(
-                            proxyRequest.request_id,
-                            this.currentAuthIndex,
-                            this._getAccountNameForIndex(this.currentAuthIndex)
-                        );
-                        this._forwardRequest(proxyRequest);
-                        initialMessage = await currentQueue.dequeue();
-
-                        const initialStatus = Number(initialMessage?.status);
-                        if (
-                            initialMessage.event_type === "error" &&
-                            !isUserAbortedError(initialMessage) &&
-                            Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
-                        ) {
-                            this.logger.warn(
-                                `[Request] Claude real stream received ${initialStatus}, switching account and retrying...`
-                            );
-                            const switched = await this._performImmediateSwitchRetry(
-                                initialMessage,
-                                requestId,
-                                immediateSwitchTracker
-                            );
-                            if (!switched) {
-                                skipFinalFailureSwitch = true;
-                                break;
-                            }
-
-                            try {
-                                currentQueue.close("retry_after_429");
-                            } catch {
-                                /* empty */
-                            }
-                            this._advanceProxyRequestAttempt(proxyRequest);
-                            currentQueue = this.connectionRegistry.createMessageQueue(
-                                requestId,
-                                this.currentAuthIndex,
-                                proxyRequest.request_attempt_id
-                            );
-                            continue;
-                        }
-
-                        break;
-                    }
+                    this._getUsageStatsService()?.recordAttempt(
+                        proxyRequest.request_id,
+                        allocatedAuthIndex,
+                        this._getAccountNameForIndex(allocatedAuthIndex)
+                    );
+                    this._forwardRequest(proxyRequest, allocatedAuthIndex);
+                    initialMessage = await currentQueue.dequeue();
 
                     if (initialMessage.event_type === "error") {
+                        finalStatus = Number(initialMessage.status) || 500;
                         this._logFinalRequestFailure(initialMessage, "Claude real stream");
                         this._sendClaudeErrorResponse(
                             res,
-                            initialMessage.status || 500,
+                            finalStatus,
                             "api_error",
                             initialMessage.message
                         );
-                        if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
-                            await this.authSwitcher.handleRequestFailureAndSwitch(initialMessage, null);
-                        } else if (skipFinalFailureSwitch) {
-                            this.logger.info(
-                                "[Request] Immediate-switch retries exhausted, skipping additional account switch."
-                            );
-                        }
                         return;
-                    }
-
-                    if (this.authSwitcher.failureCount > 0) {
-                        this.logger.debug(`✅ [Auth] Claude request successful - failure count reset to 0`);
-                        this.authSwitcher.failureCount = 0;
                     }
 
                     res.status(200).set({
@@ -1901,7 +1795,7 @@ class RequestHandler {
                         Connection: "keep-alive",
                         "Content-Type": "text/event-stream",
                     });
-                    this.logger.info(`[Request] Claude streaming response (Real Mode) started...`);
+                    this.logger.info(`[Request] Claude streaming response (Real Mode) started on account #${allocatedAuthIndex}...`);
                     await this._streamClaudeResponse(currentQueue, res, model);
                 } else {
                     // Claude Fake Stream / Non-Stream mode
@@ -1927,42 +1821,27 @@ class RequestHandler {
                     }
 
                     try {
-                        const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                        this._getUsageStatsService()?.recordAttempt(
+                            proxyRequest.request_id,
+                            allocatedAuthIndex,
+                            this._getAccountNameForIndex(allocatedAuthIndex)
+                        );
+                        this._forwardRequest(proxyRequest, allocatedAuthIndex);
+                        const initialMessage = await messageQueue.dequeue();
 
-                        if (!result.success) {
-                            this._logFinalRequestFailure(result.error, "Claude fake/non-stream");
+                        if (initialMessage.event_type === "error") {
+                            finalStatus = Number(initialMessage.status) || 500;
                             if (connectionMaintainer) clearTimeout(connectionMaintainer);
-                            if (isClaudeStream && res.headersSent) {
-                                // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
-                                this._handleClaudeRequestError(result.error, res);
-                            } else {
-                                this._sendClaudeErrorResponse(
-                                    res,
-                                    result.error.status || 500,
-                                    "api_error",
-                                    result.error.message
-                                );
-                            }
-                            if (!result.error.skipAccountSwitch && !this._isConnectionResetError(result.error)) {
-                                await this.authSwitcher.handleRequestFailureAndSwitch(result.error, null);
-                            } else if (result.error.skipAccountSwitch) {
-                                this.logger.info(
-                                    "[Request] Immediate-switch retries exhausted, skipping additional account switch."
-                                );
-                            }
+                            this._sendClaudeErrorResponse(
+                                res,
+                                finalStatus,
+                                "api_error",
+                                initialMessage.message
+                            );
                             return;
                         }
 
-                        if (this.authSwitcher.failureCount > 0) {
-                            this.logger.debug(`✅ [Auth] Claude request successful - failure count reset to 0`);
-                            this.authSwitcher.failureCount = 0;
-                        }
-
-                        // Use the queue that successfully received the initial message
-                        const activeQueue = result.queue;
-
                         if (isClaudeStream) {
-                            // Fake stream
                             if (!res.headersSent) {
                                 res.status(200).set({
                                     "Cache-Control": "no-cache",
@@ -1976,9 +1855,8 @@ class RequestHandler {
                             let fullBody = "";
                             let hadStreamError = false;
                             try {
-                                // eslint-disable-next-line no-constant-condition
                                 while (true) {
-                                    const message = await activeQueue.dequeue(this.timeouts.FAKE_STREAM);
+                                    const message = await messageQueue.dequeue(this.timeouts.FAKE_STREAM);
                                     if (message.type === "STREAM_END") {
                                         break;
                                     }
@@ -1989,7 +1867,6 @@ class RequestHandler {
                                         );
                                         this._markTrackedResponseError(res, message.message, 500);
                                         hadStreamError = true;
-                                        // Check if response is still writable before attempting to write
                                         if (this._isResponseWritable(res)) {
                                             try {
                                                 res.write(
@@ -2013,7 +1890,6 @@ class RequestHandler {
                                     if (message.data) fullBody += message.data;
                                 }
                                 if (hadStreamError) {
-                                    // Backend errored; don't attempt to translate/send a "normal" stream afterwards.
                                     return;
                                 }
                                 const streamState = {};
@@ -2032,42 +1908,45 @@ class RequestHandler {
                                             `[Request] Failed to write final fake Claude stream chunk: ${writeError.message}`
                                         );
                                     }
-                                } else {
-                                    this.logger.debug(
-                                        "[Request] Response no longer writable before final fake Claude stream chunk."
-                                    );
                                 }
                                 this.logger.info("[Request] Claude fake mode: Complete content sent at once.");
                             } catch (error) {
-                                // Classify error type and send appropriate response
+                                finalStatus = Number(error.status) || 500;
                                 this._handleFakeStreamError(error, res, "claude");
                             }
                         } else {
                             // Non-stream
-                            await this._sendClaudeNonStreamResponse(activeQueue, res, model);
+                            if (connectionMaintainer) clearTimeout(connectionMaintainer);
+                            if (this._isResponseWritable(res)) {
+                                const responseDefaults = {
+                                    created: Math.floor(Date.now() / 1000),
+                                    model,
+                                };
+                                const translatedResponse = this.formatConverter.translateGoogleToClaude(
+                                    initialMessage.body,
+                                    responseDefaults
+                                );
+                                res.status(initialMessage.status || 200).json(translatedResponse);
+                            }
                         }
                     } finally {
                         if (connectionMaintainer) clearTimeout(connectionMaintainer);
                     }
                 }
             } catch (error) {
-                // Handle queue timeout by notifying browser
+                finalStatus = Number(error.status) || 500;
                 this._handleQueueTimeout(error, requestId);
-
                 this._handleClaudeRequestError(error, res);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
-                    this.logger.info(
-                        `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
-                    );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
-                        this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
-                    });
-                    this.needsSwitchingAfterRequest = false;
+                if (this.accountScheduler && allocatedAuthIndex !== null) {
+                    this.accountScheduler.releaseAccount(allocatedAuthIndex, finalStatus);
                 }
                 if (!res.writableEnded) res.end();
             }
+        } catch (schedulerErr) {
+            this.logger.error(`[Request] Scheduling error: ${schedulerErr.message}`);
+            this._sendClaudeErrorResponse(res, 503, "overloaded_error", schedulerErr.message);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -3932,7 +3811,7 @@ class RequestHandler {
         // Parse model suffixes from model name in native Gemini generation requests
         // Only handle generation requests: /v1beta/models/{modelName}:generateContent or :streamGenerateContent
         const modelPathMatch = cleanPath.match(
-            /^(\/v1beta\/models\/)([^:]+)(:(generateContent|streamGenerateContent).*)$/
+            /^(\/v1(?:beta)?\/models\/)([^:]+)(:(generateContent|streamGenerateContent).*)$/
         );
         let modelThinkingLevel = null;
         let modelStreamingMode = null;
@@ -3947,8 +3826,9 @@ class RequestHandler {
                 FormatConverter.parseModelWebSearchSuffix(rawModelName);
             const { cleanModelName: streamStrippedModel, streamingMode: parsedStreamingMode } =
                 FormatConverter.parseModelStreamingModeSuffix(searchStrippedModel);
-            const { cleanModelName, thinkingLevel: parsedThinkingLevel } =
+            const { cleanModelName: baseModelName, thinkingLevel: parsedThinkingLevel } =
                 FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+            const cleanModelName = FormatConverter.mapModelName(baseModelName);
             modelForceWebSearch = parsedForceWebSearch;
             modelStreamingMode = parsedStreamingMode;
             modelThinkingLevel = parsedThinkingLevel;
@@ -3971,10 +3851,9 @@ class RequestHandler {
                 );
             }
 
-            // Always strip recognized directives from path model name
-            if (cleanModelName !== rawModelName) {
-                cleanPath = `${pathPrefix}${cleanModelName}${pathSuffix}`;
-            }
+            // Always normalize path prefix to v1beta and set mapped model name
+            const cleanPathPrefix = pathPrefix.replace(/^\/v1\//, "/v1beta/");
+            cleanPath = `${cleanPathPrefix}${cleanModelName}${pathSuffix}`;
         }
 
         // Force thinking for native Google requests (processed first)
@@ -3991,6 +3870,12 @@ class RequestHandler {
                     ...(bodyObj.generationConfig.thinkingConfig || {}),
                     includeThoughts: true,
                 };
+                if (this.serverSystem.thinkingLevel && !bodyObj.generationConfig.thinkingConfig.thinkingLevel) {
+                    bodyObj.generationConfig.thinkingConfig.thinkingLevel = this.serverSystem.thinkingLevel;
+                    this.logger.info(
+                        `[Proxy] Applied default thinkingLevel: ${this.serverSystem.thinkingLevel} (Google Native)`
+                    );
+                }
             }
         }
 
@@ -4108,13 +3993,22 @@ class RequestHandler {
         );
     }
 
-    _forwardRequest(proxyRequest) {
-        const connection = this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex);
+    _forwardRequest(proxyRequest, authIndex = null) {
+        const targetAuthIndex = authIndex !== null ? authIndex : this.currentAuthIndex;
+        const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
         if (connection) {
             this.logger.debug(
-                `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${this.currentAuthIndex}` +
+                `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${targetAuthIndex}` +
                     ` (attempt=${proxyRequest.request_attempt_id})`
             );
+            // Wake up page's Google backend before forwarding request
+            if (this.browserManager) {
+                const contextData = this.browserManager.contexts.get(targetAuthIndex);
+                if (contextData && contextData.page && !contextData.page.isClosed()) {
+                    this.browserManager._sendActiveTrigger(`[Request#${proxyRequest.request_id}]`, contextData.page);
+                }
+            }
+
             connection.send(
                 JSON.stringify({
                     event_type: "proxy_request",
@@ -4123,7 +4017,7 @@ class RequestHandler {
             );
         } else {
             throw new Error(
-                `Unable to forward request: No WebSocket connection found for authIndex=${this.currentAuthIndex}`
+                `Unable to forward request: No WebSocket connection found for authIndex=${targetAuthIndex}`
             );
         }
     }

@@ -2043,6 +2043,9 @@ class BrowserManager {
                 }
             }
 
+            // Wake up Google backend on initialization
+            this._sendActiveTrigger(`[Context#${authIndex}]`, page);
+
             // Final check before adding to contexts map
             if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
                 throw new ContextAbortedError(authIndex, "marked for deletion");
@@ -2529,9 +2532,10 @@ class BrowserManager {
 
         // If this was the last context, close the browser to free resources
         // This ensures a clean state when all accounts are deleted
-        // Only close if there are no contexts AND no contexts being initialized
-        if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
-            this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
+        // Only close if there are no contexts AND no contexts being initialized AND maxContexts <= 1
+        const maxContexts = parseInt(this.config.maxContexts || "1", 10);
+        if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser && maxContexts <= 1) {
+            this.logger.info(`[Browser] All contexts closed and maxContexts <= 1, closing browser instance...`);
             await this.closeBrowser();
         }
     }

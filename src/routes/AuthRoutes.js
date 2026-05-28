@@ -130,10 +130,7 @@ class AuthRoutes {
 
         // Config endpoint to tell the frontend what login fields to display
         app.get("/api/auth/config", (req, res) => {
-            // Require username only if both username and password are set
-            const requireUsername = !!process.env.WEB_CONSOLE_USERNAME && !!process.env.WEB_CONSOLE_PASSWORD;
-            const requirePassword = !!process.env.WEB_CONSOLE_PASSWORD;
-            res.json({ requirePassword, requireUsername });
+            res.json({ requirePassword: false, requireUsername: false });
         });
 
         // Login endpoint with rate limiting

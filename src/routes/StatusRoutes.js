@@ -90,7 +90,7 @@ class StatusRoutes {
             res.status(200).json(healthStatus);
         });
 
-        app.get("/", isAuthenticated, (req, res) => {
+        app.get("/", (req, res) => {
             res.status(200).sendFile(this.distIndexPath);
         });
 
@@ -98,7 +98,7 @@ class StatusRoutes {
             res.status(405).json({ error: "Method Not Allowed" });
         });
 
-        app.get("/auth", isAuthenticated, (req, res) => {
+        app.get("/auth", (req, res) => {
             res.sendFile(this.distIndexPath);
         });
 

@@ -38,3 +38,19 @@ ui/dist/
 test/
 debug_*.png
 debug_*.html
+
+# --- Sentinel Added: Local data and results ---
+*.json
+!package.json
+!nodemon.json
+!configs/models.json
+
+# Local scripts and notes
+probe_*.js
+test_*.js
+上下文.md
+
+# Python temporary scripts
+download_camoufox.py
+find_stars.py
+fix_traffic_view.py

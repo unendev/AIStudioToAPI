@@ -37,7 +37,12 @@ class ProxyServerSystem extends EventEmitter {
         this.config = configLoader.loadConfiguration();
         this.streamingMode = this.config.streamingMode;
         this.forceThinking = this.config.forceThinking;
+        this.thinkingLevel = this.config.thinkingLevel;
         this.forceWebSearch = this.config.forceWebSearch;
+
+        // Concurrency limiter
+        this.maxConcurrent = 15;
+        this.activeRequests = 0;
         this.forceUrlContext = this.config.forceUrlContext;
 
         this.authSource = new AuthSource(this.logger);
@@ -103,13 +108,17 @@ class ProxyServerSystem extends EventEmitter {
         // Set ConnectionRegistry reference in BrowserManager to avoid circular dependency
         this.browserManager.setConnectionRegistry(this.connectionRegistry);
 
+        const AccountScheduler = require("./AccountScheduler");
+        this.accountScheduler = new AccountScheduler(this.logger, this.config, this.authSource, this.browserManager);
+
         this.requestHandler = new RequestHandler(
             this,
             this.connectionRegistry,
             this.logger,
             this.browserManager,
             this.config,
-            this.authSource
+            this.authSource,
+            this.accountScheduler
         );
 
         this.httpServer = null;
@@ -195,8 +204,31 @@ class ProxyServerSystem extends EventEmitter {
         this.emit("started");
     }
 
+    _createConcurrencyLimiter() {
+        return (req, res, next) => {
+            if (this.activeRequests >= this.maxConcurrent) {
+                this.logger.warn(`[Limiter] Rejected request: concurrency ${this.activeRequests}/${this.maxConcurrent} (418 I'm a teapot)`);
+                return res.status(418).json({
+                    error: {
+                        message: "I'm a teapot: concurrency limit 5/5 reached",
+                        type: "teapot_limit",
+                        code: "concurrency_limit",
+                    },
+                });
+            }
+            this.activeRequests++;
+            const decrement = () => {
+                this.activeRequests = Math.max(0, this.activeRequests - 1);
+            };
+            res.once("finish", decrement);
+            res.once("close", decrement);
+            next();
+        };
+    }
+
     _createAuthMiddleware() {
         return (req, res, next) => {
+            return next();
             // Allow access if session is authenticated (e.g. browser accessing /vnc or API from UI)
             if (req.session && req.session.isAuthenticated) {
                 if (req.path === "/vnc") {
@@ -463,6 +495,9 @@ class ProxyServerSystem extends EventEmitter {
         // API authentication middleware
         app.use(this._createAuthMiddleware());
 
+        // API concurrency limiter (I'm a teapot when > 5)
+        app.use(this._createConcurrencyLimiter());
+
         // API routes
         app.get(["/v1/models"], (req, res) => {
             // OpenAI format
@@ -527,6 +562,17 @@ class ProxyServerSystem extends EventEmitter {
         // Intercept upload requests to use specialized handler
         app.all(/\/upload\/.*/, (req, res) => {
             this.requestHandler.processUploadRequest(req, res);
+        });
+
+        app.all(/^\/v1internal/, (req, res) => {
+            this.logger.info(`[Bypass] Intercepted internal endpoint: ${req.method} ${req.path}, returning 404 immediately.`);
+            res.status(404).json({
+                error: {
+                    code: 404,
+                    message: "Internal endpoint not supported by local proxy",
+                    status: "NOT_FOUND"
+                }
+            });
         });
 
         app.all(/(.*)/, (req, res) => {

@@ -132,6 +132,43 @@ class FormatConverter {
         return { cleanModelName: modelName, thinkingLevel: null };
     }
 
+    /**
+     * Map old/alternative model names to the active/latest model names.
+     * 
+     * @param {string} modelName - Incoming clean model name
+     * @returns {string} Mapped model name
+     */
+    static mapModelName(modelName) {
+        if (!modelName || typeof modelName !== "string") {
+            return modelName;
+        }
+
+        const MODEL_ALIASES = {
+            // Map Gemini 3.0 Pro to Gemini 3.1 Pro Preview
+            "gemini-3.0-pro": "gemini-3.1-pro-preview",
+            "gemini-3-pro": "gemini-3.1-pro-preview",
+            "gemini-3.0-pro-preview": "gemini-3.1-pro-preview",
+            "gemini-3-pro-preview": "gemini-3.1-pro-preview",
+
+            // Map old Flash models to newer ones (only when specifically needed)
+            "gemini-3.0-flash": "gemini-3.5-flash",
+            "gemini-3.0-flash-preview": "gemini-3.5-flash",
+            // "gemini-3-flash-preview" removed — must NOT be mapped to 3.5
+            "gemini-3-flash": "gemini-3-flash-preview",
+            "gemini-3.5-flash": "gemini-3-flash-preview",
+            "gemini-3.0-flash-thinking": "gemini-3.1-pro-preview",
+            "gemini-3-flash-thinking-preview": "gemini-3.1-pro-preview"
+        };
+
+        const lowerModel = modelName.toLowerCase();
+        if (MODEL_ALIASES[lowerModel]) {
+            return MODEL_ALIASES[lowerModel];
+        }
+
+        // Return original if no mapping exists
+        return modelName;
+    }
+
     constructor(logger, serverSystem) {
         this.logger = logger;
         this.serverSystem = serverSystem;
@@ -493,13 +530,14 @@ class FormatConverter {
         // 2) streaming override: trailing `-real` / `-fake` after any thinking suffix
         // 3) thinkingLevel override: trailing `-minimal` / `(minimal)` etc.
         // Combined user-facing suffix order: thinking -> streaming -> search
-        const rawModel = openaiBody.model || "gemini-2.5-flash-lite";
+        const rawModel = openaiBody.model || "gemini-3.1-pro-preview";
         const { cleanModelName: searchStrippedModel, forceWebSearch: modelForceWebSearch } =
             FormatConverter.parseModelWebSearchSuffix(rawModel);
         const { cleanModelName: streamStrippedModel, streamingMode: modelStreamingMode } =
             FormatConverter.parseModelStreamingModeSuffix(searchStrippedModel);
-        const { cleanModelName, thinkingLevel: modelThinkingLevel } =
+        const { cleanModelName: baseModelName, thinkingLevel: modelThinkingLevel } =
             FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+        const cleanModelName = FormatConverter.mapModelName(baseModelName);
 
         if (modelForceWebSearch) {
             this.logger.info(
@@ -815,6 +853,10 @@ class FormatConverter {
         if (this.serverSystem.forceThinking && (!thinkingConfig || thinkingConfig.includeThoughts === undefined)) {
             this.logger.info("[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for OpenAI request.");
             thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
+            if (this.serverSystem.thinkingLevel && !thinkingConfig.thinkingLevel) {
+                thinkingConfig.thinkingLevel = this.serverSystem.thinkingLevel;
+                this.logger.info(`[Adapter] Applied default thinkingLevel: ${this.serverSystem.thinkingLevel} for OpenAI request.`);
+            }
         }
 
         // If model name suffix specifies thinkingLevel, override directly (highest priority)
@@ -1009,7 +1051,7 @@ class FormatConverter {
      * @param {string} modelName - The model name
      * @param {object} streamState - Optional state object to track thought mode
      */
-    translateGoogleToOpenAIStream(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
+    translateGoogleToOpenAIStream(googleChunk, modelName = "gemini-3.1-pro-preview", streamState = null) {
         this.logger.debug(`[Adapter] Debug: Received Google chunk for OpenAI: ${googleChunk}`);
 
         // Ensure streamState exists to properly track tool call indices
@@ -1191,7 +1233,7 @@ class FormatConverter {
      * @param {object} streamState - State object to track stream progress
      * @returns {string|null} - SSE formatted events for Response API
      */
-    translateGoogleToResponseAPIStream(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
+    translateGoogleToResponseAPIStream(googleChunk, modelName = "gemini-3.1-pro-preview", streamState = null) {
         this.logger.debug(`[Adapter] Debug: Received Google chunk for Response API: ${googleChunk}`);
 
         // Ensure streamState exists
@@ -1674,7 +1716,7 @@ class FormatConverter {
     /**
      * Convert Google non-stream response to OpenAI format
      */
-    convertGoogleToOpenAINonStream(googleResponse, modelName = "gemini-2.5-flash-lite") {
+    convertGoogleToOpenAINonStream(googleResponse, modelName = "gemini-3.1-pro-preview") {
         try {
             this.logger.debug(
                 `[Adapter] Debug: Received Google response for OpenAI non-stream: ${JSON.stringify(googleResponse)}`
@@ -1782,7 +1824,7 @@ class FormatConverter {
      * @param {string} modelName - Model name
      * @returns {object} - OpenAI Response API format response
      */
-    convertGoogleToResponseAPINonStream(googleResponse, modelName = "gemini-2.5-flash-lite", responseDefaults = {}) {
+    convertGoogleToResponseAPINonStream(googleResponse, modelName = "gemini-3.1-pro-preview", responseDefaults = {}) {
         try {
             this.logger.debug(
                 `[Adapter] Debug: Received Google response for Response API non-stream: ${JSON.stringify(googleResponse)}`
@@ -2040,13 +2082,14 @@ class FormatConverter {
         // 2) streaming override: trailing `-real` / `-fake` after any thinking suffix
         // 3) thinkingLevel override: trailing `-minimal` / `(minimal)` etc.
         // Combined user-facing suffix order: thinking -> streaming -> search
-        const rawModel = claudeBody.model || "gemini-2.5-flash-lite";
+        const rawModel = claudeBody.model || "gemini-3.1-pro-preview";
         const { cleanModelName: searchStrippedModel, forceWebSearch: modelForceWebSearch } =
             FormatConverter.parseModelWebSearchSuffix(rawModel);
         const { cleanModelName: streamStrippedModel, streamingMode: modelStreamingMode } =
             FormatConverter.parseModelStreamingModeSuffix(searchStrippedModel);
-        const { cleanModelName, thinkingLevel: modelThinkingLevel } =
+        const { cleanModelName: baseModelName, thinkingLevel: modelThinkingLevel } =
             FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+        const cleanModelName = FormatConverter.mapModelName(baseModelName);
 
         if (modelForceWebSearch) {
             this.logger.info(
@@ -2311,6 +2354,10 @@ class FormatConverter {
         if (this.serverSystem.forceThinking && (!thinkingConfig || thinkingConfig.includeThoughts === undefined)) {
             this.logger.info("[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for Claude request.");
             thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
+            if (this.serverSystem.thinkingLevel && !thinkingConfig.thinkingLevel) {
+                thinkingConfig.thinkingLevel = this.serverSystem.thinkingLevel;
+                this.logger.info(`[Adapter] Applied default thinkingLevel: ${this.serverSystem.thinkingLevel} for Claude request.`);
+            }
         }
 
         // Apply model name suffix thinkingLevel
@@ -2472,7 +2519,7 @@ class FormatConverter {
      * @param {string} modelName - The model name
      * @param {object} streamState - State object to track streaming progress
      */
-    translateGoogleToClaudeStream(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
+    translateGoogleToClaudeStream(googleChunk, modelName = "gemini-3.1-pro-preview", streamState = null) {
         this.logger.debug(`[Adapter] Debug: Received Google chunk for Claude: ${googleChunk}`);
 
         if (!streamState) {
@@ -2709,7 +2756,7 @@ class FormatConverter {
     /**
      * Convert Google non-stream response to Claude format
      */
-    convertGoogleToClaudeNonStream(googleResponse, modelName = "gemini-2.5-flash-lite") {
+    convertGoogleToClaudeNonStream(googleResponse, modelName = "gemini-3.1-pro-preview") {
         try {
             this.logger.debug(
                 `[Adapter] Debug: Received Google response for Claude non-stream: ${JSON.stringify(googleResponse)}`
@@ -2824,13 +2871,14 @@ class FormatConverter {
         // 2) streaming override: trailing `-real` / `-fake` after any thinking suffix
         // 3) thinkingLevel override: trailing `-minimal` / `(minimal)` etc.
         // Combined user-facing suffix order: thinking -> streaming -> search
-        const rawModel = responseBody.model || "gemini-2.5-flash-lite";
+        const rawModel = responseBody.model || "gemini-3.1-pro-preview";
         const { cleanModelName: searchStrippedModel, forceWebSearch: modelForceWebSearch } =
             FormatConverter.parseModelWebSearchSuffix(rawModel);
         const { cleanModelName: streamStrippedModel, streamingMode: modelStreamingMode } =
             FormatConverter.parseModelStreamingModeSuffix(searchStrippedModel);
-        const { cleanModelName, thinkingLevel: modelThinkingLevel } =
+        const { cleanModelName: baseModelName, thinkingLevel: modelThinkingLevel } =
             FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+        const cleanModelName = FormatConverter.mapModelName(baseModelName);
 
         if (modelForceWebSearch) {
             this.logger.info(
@@ -3111,6 +3159,10 @@ class FormatConverter {
                 "[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for OpenAI Response API request."
             );
             thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
+            if (this.serverSystem.thinkingLevel && !thinkingConfig.thinkingLevel) {
+                thinkingConfig.thinkingLevel = this.serverSystem.thinkingLevel;
+                this.logger.info(`[Adapter] Applied default thinkingLevel: ${this.serverSystem.thinkingLevel} for OpenAI Response API request.`);
+            }
         }
 
         // If model name suffix specifies thinkingLevel, override directly (highest priority)
@@ -3323,3 +3375,5 @@ class FormatConverter {
 }
 
 module.exports = FormatConverter;
+
+

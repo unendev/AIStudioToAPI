@@ -7,7 +7,14 @@
 
 // Load environment variables based on NODE_ENV
 const path = require("path");
-const envFile = process.env.NODE_ENV === "production" ? ".env" : ".env.development";
+const fs = require("fs");
+let envFile = ".env";
+if (process.env.NODE_ENV !== "production") {
+    const devPath = path.resolve(__dirname, ".env.development");
+    if (fs.existsSync(devPath)) {
+        envFile = ".env.development";
+    }
+}
 require("dotenv").config({ path: path.resolve(__dirname, envFile) });
 
 const ProxyServerSystem = require("./src/core/ProxyServerSystem");

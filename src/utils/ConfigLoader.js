@@ -28,6 +28,7 @@ class ConfigLoader {
             enableUsageStats: true,
             failureThreshold: 3,
             forceThinking: false,
+            thinkingLevel: null,
             forceUrlContext: false,
             forceWebSearch: false,
             host: "0.0.0.0",
@@ -40,6 +41,9 @@ class ConfigLoader {
             streamingMode: "real",
             switchOnUses: 40,
             wsPort: 9998,
+            singleAccountConcurrency: 3,
+            accountCoolDownMs: 300000,
+            globalQueueTimeoutMs: 30000,
         };
 
         // Environment variable overrides
@@ -83,6 +87,15 @@ class ConfigLoader {
         }
         if (process.env.CHECK_UPDATE) config.checkUpdate = process.env.CHECK_UPDATE.toLowerCase() !== "false";
         if (process.env.FORCE_THINKING) config.forceThinking = process.env.FORCE_THINKING.toLowerCase() === "true";
+        if (process.env.THINKING_LEVEL) {
+            const level = process.env.THINKING_LEVEL.toLowerCase();
+            const allowed = ["high", "low", "medium", "minimal"];
+            if (allowed.includes(level)) {
+                config.thinkingLevel = level.toUpperCase();
+            } else {
+                this.logger.warn(`[Config] Invalid THINKING_LEVEL "${process.env.THINKING_LEVEL}", ignoring.`);
+            }
+        }
         if (process.env.FORCE_WEB_SEARCH) config.forceWebSearch = process.env.FORCE_WEB_SEARCH.toLowerCase() === "true";
         if (process.env.FORCE_URL_CONTEXT)
             config.forceUrlContext = process.env.FORCE_URL_CONTEXT.toLowerCase() === "true";
@@ -104,6 +117,19 @@ class ConfigLoader {
                 );
             }
         }
+        if (process.env.SINGLE_ACCOUNT_CONCURRENCY) {
+            const parsed = parseInt(process.env.SINGLE_ACCOUNT_CONCURRENCY, 10);
+            config.singleAccountConcurrency = Number.isFinite(parsed) ? Math.max(1, parsed) : config.singleAccountConcurrency;
+        }
+        if (process.env.ACCOUNT_COOL_DOWN_MS) {
+            const parsed = parseInt(process.env.ACCOUNT_COOL_DOWN_MS, 10);
+            config.accountCoolDownMs = Number.isFinite(parsed) ? Math.max(1000, parsed) : config.accountCoolDownMs;
+        }
+        if (process.env.GLOBAL_QUEUE_TIMEOUT_MS) {
+            const parsed = parseInt(process.env.GLOBAL_QUEUE_TIMEOUT_MS, 10);
+            config.globalQueueTimeoutMs = Number.isFinite(parsed) ? Math.max(1000, parsed) : config.globalQueueTimeoutMs;
+        }
+
         if (process.env.ENABLE_AUTH_UPDATE)
             config.enableAuthUpdate = process.env.ENABLE_AUTH_UPDATE.toLowerCase() !== "false";
         if (process.env.ENABLE_USAGE_STATS)
@@ -159,17 +185,17 @@ class ConfigLoader {
                     );
                 } else {
                     this.logger.warn(`[System] models.json is not in the expected format, using default model list.`);
-                    config.modelList = [{ name: "models/gemini-2.5-flash-lite" }];
+                    config.modelList = [{ name: "models/gemini-3.1-pro-preview" }];
                 }
             } else {
                 this.logger.warn(`[System] models.json file not found, using default model list.`);
-                config.modelList = [{ name: "models/gemini-2.5-flash-lite" }];
+                config.modelList = [{ name: "models/gemini-3.1-pro-preview" }];
             }
         } catch (error) {
             this.logger.error(
                 `[System] Failed to read or parse models.json: ${error.message}, using default model list.`
             );
-            config.modelList = [{ name: "models/gemini-2.5-flash-lite" }];
+            config.modelList = [{ name: "models/gemini-3.1-pro-preview" }];
         }
 
         this._printConfiguration(config);
@@ -182,6 +208,9 @@ class ConfigLoader {
         this.logger.info(`  Listening Address: ${config.host}`);
         this.logger.info(`  Streaming Mode: ${config.streamingMode}`);
         this.logger.info(`  Force Thinking: ${config.forceThinking}`);
+        if (config.thinkingLevel) {
+            this.logger.info(`  Default Thinking Level: ${config.thinkingLevel}`);
+        }
         this.logger.info(`  Force Web Search: ${config.forceWebSearch}`);
         this.logger.info(`  Force URL Context: ${config.forceUrlContext}`);
         this.logger.info(`  Check Update: ${config.checkUpdate}`);
@@ -189,6 +218,9 @@ class ConfigLoader {
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
+        this.logger.info(`  Single Account Concurrency Limit: ${config.singleAccountConcurrency}`);
+        this.logger.info(`  Account Cool Down: ${config.accountCoolDownMs}ms`);
+        this.logger.info(`  Global Queue Timeout: ${config.globalQueueTimeoutMs}ms`);
         this.logger.info(
             `  Usage-based Switch Threshold: ${
                 config.switchOnUses > 0 ? `Switch after every ${config.switchOnUses} requests` : "Disabled"

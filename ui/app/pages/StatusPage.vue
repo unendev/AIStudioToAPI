@@ -80,6 +80,29 @@
                 </button>
                 <button
                     class="menu-item"
+                    :class="{ active: activeTab === 'traffic' }"
+                    title="Traffic Log"
+                    @click="switchTab('traffic')"
+                >
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="24"
+                        height="24"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                    >
+                        <path d="M3 3v18h18"></path>
+                        <path d="M18 17V9"></path>
+                        <path d="M13 17V5"></path>
+                        <path d="M8 17v-3"></path>
+                    </svg>
+                </button>
+                <button
+                    class="menu-item"
                     :class="{ active: activeTab === 'stats' }"
                     :title="t('usageStats')"
                     @click="switchTab('stats')"
@@ -2680,6 +2703,231 @@
                     <pre id="log-container" v-html="formattedLogs"></pre>
                 </div>
             </div>
+
+            <!-- TRAFFIC LOG VIEW -->
+            <div v-if="activeTab === 'traffic'" class="view-container">
+                <header class="page-header" style="display: flex; justify-content: space-between; align-items: center">
+                    <h1>Traffic Log</h1>
+                    <div style="display: flex; gap: 10px; align-items: center">
+                        <span style="font-size: 12px; color: var(--text-secondary)"
+                            >{{ trafficLog.length }} records</span
+                        >
+                        <button class="meta-chip" type="button" @click="fetchTrafficLog">
+                            <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="14"
+                                height="14"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                            >
+                                <polyline points="23 4 23 10 17 10"></polyline>
+                                <polyline points="1 20 1 14 7 14"></polyline>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                            </svg>
+                            Refresh
+                        </button>
+                    </div>
+                </header>
+                <div class="dashboard-grid">
+                    <div class="status-card" style="grid-column: 1/-1">
+                        <div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap">
+                            <input
+                                v-model="trafficFilter.model"
+                                placeholder="Filter model..."
+                                style="
+                                    flex: 1;
+                                    min-width: 120px;
+                                    padding: 6px 10px;
+                                    border: 1px solid var(--border-color);
+                                    border-radius: 6px;
+                                    background: var(--bg-primary);
+                                    color: var(--text-primary);
+                                "
+                                @input="filterTrafficLog"
+                            />
+                            <input
+                                v-model="trafficFilter.path"
+                                placeholder="Filter path..."
+                                style="
+                                    flex: 1;
+                                    min-width: 120px;
+                                    padding: 6px 10px;
+                                    border: 1px solid var(--border-color);
+                                    border-radius: 6px;
+                                    background: var(--bg-primary);
+                                    color: var(--text-primary);
+                                "
+                                @input="filterTrafficLog"
+                            />
+                            <select
+                                v-model="trafficFilter.outcome"
+                                style="
+                                    padding: 6px 10px;
+                                    border: 1px solid var(--border-color);
+                                    border-radius: 6px;
+                                    background: var(--bg-primary);
+                                    color: var(--text-primary);
+                                "
+                                @change="filterTrafficLog"
+                            >
+                                <option value="">All outcomes</option>
+                                <option value="success">Success</option>
+                                <option value="error">Error</option>
+                                <option value="aborted">Aborted</option>
+                            </select>
+                        </div>
+                        <div
+                            style="
+                                max-height: 60vh;
+                                overflow: auto;
+                                border: 1px solid var(--border-color);
+                                border-radius: 8px;
+                            "
+                        >
+                            <table style="width: 100%; border-collapse: collapse; font-size: 12px">
+                                <thead style="position: sticky; top: 0; background: var(--bg-secondary); z-index: 1">
+                                    <tr>
+                                        <th
+                                            style="
+                                                padding: 8px 10px;
+                                                text-align: left;
+                                                border-bottom: 1px solid var(--border-color);
+                                            "
+                                        >
+                                            Time
+                                        </th>
+                                        <th
+                                            style="
+                                                padding: 8px 10px;
+                                                text-align: left;
+                                                border-bottom: 1px solid var(--border-color);
+                                            "
+                                        >
+                                            Method
+                                        </th>
+                                        <th
+                                            style="
+                                                padding: 8px 10px;
+                                                text-align: left;
+                                                border-bottom: 1px solid var(--border-color);
+                                            "
+                                        >
+                                            Path
+                                        </th>
+                                        <th
+                                            style="
+                                                padding: 8px 10px;
+                                                text-align: left;
+                                                border-bottom: 1px solid var(--border-color);
+                                            "
+                                        >
+                                            Model
+                                        </th>
+                                        <th
+                                            style="
+                                                padding: 8px 10px;
+                                                text-align: center;
+                                                border-bottom: 1px solid var(--border-color);
+                                            "
+                                        >
+                                            Status
+                                        </th>
+                                        <th
+                                            style="
+                                                padding: 8px 10px;
+                                                text-align: center;
+                                                border-bottom: 1px solid var(--border-color);
+                                            "
+                                        >
+                                            Outcome
+                                        </th>
+                                        <th
+                                            style="
+                                                padding: 8px 10px;
+                                                text-align: right;
+                                                border-bottom: 1px solid var(--border-color);
+                                            "
+                                        >
+                                            Duration
+                                        </th>
+                                        <th
+                                            style="
+                                                padding: 8px 10px;
+                                                text-align: right;
+                                                border-bottom: 1px solid var(--border-color);
+                                            "
+                                        >
+                                            Tokens
+                                        </th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr
+                                        v-for="row in filteredTrafficLog"
+                                        :key="row.sequence"
+                                        style="border-bottom: 1px solid var(--border-color)"
+                                    >
+                                        <td
+                                            style="
+                                                padding: 6px 10px;
+                                                font-family: monospace;
+                                                color: var(--text-secondary);
+                                                white-space: nowrap;
+                                            "
+                                        >
+                                            {{ formatDateTime(row.startedAt) }}
+                                        </td>
+                                        <td style="padding: 6px 10px">
+                                            <span :style="methodBadgeStyle(row.method)">{{ row.method }}</span>
+                                        </td>
+                                        <td style="padding: 6px 10px; color: var(--text-primary)">{{ row.path }}</td>
+                                        <td style="padding: 6px 10px; font-family: monospace">
+                                            {{ row.model || "-" }}
+                                        </td>
+                                        <td style="padding: 6px 10px; text-align: center">
+                                            <span :style="statusBadgeStyle(row.statusCode)">{{
+                                                row.statusCode || "-"
+                                            }}</span>
+                                        </td>
+                                        <td style="padding: 6px 10px; text-align: center">
+                                            <span
+                                                v-if="row.outcome === 'success'"
+                                                style="color: #28a745; font-weight: 600"
+                                                >●</span
+                                            >
+                                            <span
+                                                v-else-if="row.outcome === 'error'"
+                                                style="color: #e74c3c; font-weight: 600"
+                                                >●</span
+                                            >
+                                            <span v-else style="color: #f0ad4e; font-weight: 600">●</span>
+                                            {{ row.outcome }}
+                                        </td>
+                                        <td style="padding: 6px 10px; text-align: right; font-family: monospace">
+                                            {{ row.durationMs }}ms
+                                        </td>
+                                        <td style="padding: 6px 10px; text-align: right; font-family: monospace">
+                                            {{ row.tokens || "-" }}
+                                        </td>
+                                    </tr>
+                                    <tr v-if="filteredTrafficLog.length === 0">
+                                        <td
+                                            colspan="8"
+                                            style="padding: 40px; text-align: center; color: var(--text-secondary)"
+                                        >
+                                            No traffic records
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </main>
 
         <!-- Mobile Floating Action Buttons -->
@@ -2772,6 +3020,12 @@ const router = useRouter();
 const fileInput = ref(null);
 const usageStatsImportInput = ref(null);
 const activeTab = ref("home");
+
+// Traffic Log state
+const trafficLog = ref([]);
+const filteredTrafficLog = ref([]);
+const trafficFilter = reactive({ model: "", outcome: "", path: "" });
+
 const isDownloadingUsageStats = ref(false);
 const isImportingUsageStats = ref(false);
 const isUsageStatsTransferBusy = computed(() => isDownloadingUsageStats.value || isImportingUsageStats.value);
@@ -3620,6 +3874,57 @@ const getApiErrorMessage = data => {
     return t("unknownError");
 };
 
+const fetchTrafficLog = async () => {
+    try {
+        const res = await fetch("/api/usage-stats");
+        if (!res.ok) return;
+        const data = await res.json();
+        const records = data.records || [];
+        trafficLog.value = records.map(r => ({
+            durationMs: r.durationMs,
+            method: r.method,
+            model: r.model,
+            outcome: r.outcome,
+            path: r.path,
+            sequence: r.sequence,
+            startedAt: r.startedAt,
+            statusCode: r.statusCode,
+            tokens: null,
+        }));
+        filterTrafficLog();
+    } catch (e) {
+        console.error("fetchTrafficLog error:", e);
+    }
+};
+
+const filterTrafficLog = () => {
+    filteredTrafficLog.value = trafficLog.value.filter(r => {
+        if (trafficFilter.model && !(r.model || "").toLowerCase().includes(trafficFilter.model.toLowerCase()))
+            return false;
+        if (trafficFilter.path && !(r.path || "").toLowerCase().includes(trafficFilter.path.toLowerCase()))
+            return false;
+        if (trafficFilter.outcome && r.outcome !== trafficFilter.outcome) return false;
+        return true;
+    });
+};
+
+const methodBadgeStyle = method => {
+    const map = {
+        DELETE: "background:#f8d7da;color:#721c24",
+        GET: "background:#d4edda;color:#155724",
+        POST: "background:#cce5ff;color:#004085",
+        PUT: "background:#fff3cd;color:#856404",
+    };
+    return `display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;${map[method] || "background:#e2e3e5;color:#383d41"}`;
+};
+
+const statusBadgeStyle = code => {
+    if (!code) return "color:var(--text-secondary)";
+    if (code >= 200 && code < 300) return "color:#28a745;font-weight:600";
+    if (code >= 400) return "color:#e74c3c;font-weight:600";
+    return "color:#f0ad4e;font-weight:600";
+};
+
 const switchTab = tabName => {
     if (activeTab.value === "logs") {
         const logContainer = document.getElementById("log-container");
@@ -3637,6 +3942,9 @@ const switchTab = tabName => {
                 logContainer.scrollTop = state.logScrollTop || 0;
             }
         });
+    }
+    if (tabName === "traffic") {
+        fetchTrafficLog();
     }
 };
 
