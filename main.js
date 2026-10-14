@@ -10,6 +10,14 @@ const path = require("path");
 const envFile = process.env.NODE_ENV === "production" ? ".env" : ".env.development";
 require("dotenv").config({ path: path.resolve(__dirname, envFile) });
 
+// Process exception shields to prevent abrupt terminations from browser socket resets
+process.on("uncaughtException", err => {
+    console.error("[Process Guard] Uncaught Exception:", err?.message || err);
+});
+process.on("unhandledRejection", reason => {
+    console.warn("[Process Guard] Unhandled Rejection:", reason?.message || reason);
+});
+
 const ProxyServerSystem = require("./src/core/ProxyServerSystem");
 
 /**

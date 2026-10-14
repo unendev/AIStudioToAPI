@@ -327,6 +327,57 @@ class BrowserManager {
         return false;
     }
 
+    async _clickRemixButtonIfVisible(page, logPrefix = "[Browser]") {
+        try {
+            const clicked = await page.evaluate(() => {
+                const isVisible = element => {
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const getText = element => (element.innerText || element.textContent || "").trim();
+
+                const buttons = Array.from(document.querySelectorAll("button, div[role='button'], a[role='button']"));
+
+                // 1. Check for modal/dialog confirming "Remix app"
+                for (const btn of buttons) {
+                    if (!isVisible(btn)) continue;
+                    const text = getText(btn);
+                    if (text === "Remix app" || text.includes("Remix app")) {
+                        btn.click();
+                        return "Remix app (dialog confirmation)";
+                    }
+                }
+
+                // 2. Check for top header Remix button
+                for (const btn of buttons) {
+                    if (!isVisible(btn)) continue;
+                    const text = getText(btn);
+                    const aria = btn.getAttribute("aria-label") || "";
+                    if (text === "Remix" || aria.includes("Remix") || text.startsWith("Remix")) {
+                        // Skip if it is within prompt input toolbar
+                        if (btn.closest(".prompt-input, .input-container, textarea")) continue;
+                        btn.click();
+                        return "Remix (header action)";
+                    }
+                }
+
+                return null;
+            });
+
+            if (clicked) {
+                this.logger.info(`${logPrefix} 🚀 Automatically clicked "${clicked}" to fork app into account!`);
+                return true;
+            }
+        } catch (error) {
+            if (this._isCriticalPageError(error)) {
+                throw error;
+            }
+            this.logger.debug(`${logPrefix} Notice checking Remix button: ${error.message}`);
+        }
+
+        return false;
+    }
+
     /**
      * Helper: Wait for WebSocket initialization with log monitoring
      * Supports abort for background tasks and context deletion
@@ -400,6 +451,10 @@ class BrowserManager {
 
                 if (iteration % 5 === 0) {
                     await this._clickLaunchButtonIfVisible(page, logPrefix);
+                }
+
+                if (iteration % 2 === 0) {
+                    await this._clickRemixButtonIfVisible(page, logPrefix);
                 }
 
                 // Check for page errors

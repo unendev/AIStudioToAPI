@@ -313,9 +313,27 @@ class UsageStatsService {
     _appendRecord(record) {
         if (!this.enabled) return;
         const line = JSON.stringify(record) + "\n";
+        this._writeCounter = (this._writeCounter || 0) + 1;
         this.appendPromise = this.appendPromise
             .catch(() => {})
-            .then(() => fs.promises.appendFile(this.statsFilePath, line, "utf-8"))
+            .then(async () => {
+                await fs.promises.appendFile(this.statsFilePath, line, "utf-8");
+                if (this._writeCounter % 200 === 0) {
+                    try {
+                        const stat = await fs.promises.stat(this.statsFilePath);
+                        if (stat.size > 2 * 1024 * 1024) {
+                            const content = await fs.promises.readFile(this.statsFilePath, "utf-8");
+                            const lines = content.trim().split("\n");
+                            if (lines.length > 1000) {
+                                const keepLines = lines.slice(-1000).join("\n") + "\n";
+                                await fs.promises.writeFile(this.statsFilePath, keepLines, "utf-8");
+                            }
+                        }
+                    } catch (e) {
+                        // ignore error
+                    }
+                }
+            })
             .catch(err => {
                 if (this.logger) {
                     this.logger.warn(`[UsageStats] Failed to append record: ${err.message}`);

@@ -18,23 +18,23 @@ function parseAiStudioAppUrl(value) {
     try {
         const url = new URL(rawValue);
         const pathSegments = url.pathname.split("/").filter(Boolean);
+        const isAiStudio = url.hostname === "ai.studio" || url.hostname === "aistudio.google.com";
         if (
             url.protocol !== "https:" ||
-            url.hostname !== "ai.studio" ||
+            !isAiStudio ||
             url.username ||
             url.password ||
-            url.search ||
-            url.hash ||
             pathSegments.length !== 2 ||
             pathSegments[0] !== "apps"
         ) {
             return null;
         }
-        return `https://ai.studio/apps/${pathSegments[1]}`;
+        return `https://aistudio.google.com/apps/${pathSegments[1]}`;
     } catch {
         return null;
     }
 }
+
 
 /**
  * Configuration Loader Module
