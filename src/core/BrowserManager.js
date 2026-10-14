@@ -194,8 +194,12 @@ class BrowserManager {
             return await page.evaluate(() => {
                 // eslint-disable-next-line no-undef
                 const bodyText = document.body.innerText || "";
+                // eslint-disable-next-line no-undef
+                const hasModal = !!document.querySelector(
+                    "#g1-welcome-dialog, ms-g1-welcome-dialog, mat-dialog-container, .cdk-overlay-container .cdk-overlay-pane, .dialog-backdrop-blur-overlay"
+                );
                 return {
-                    appletFailed: bodyText.includes("Failed to initialize applet"),
+                    appletFailed: !hasModal && bodyText.includes("Failed to initialize applet"),
                     concurrentUpdates:
                         bodyText.includes("There are concurrent updates") || bodyText.includes("concurrent updates"),
                     snapshotFailed:
@@ -283,7 +287,10 @@ class BrowserManager {
                     return rect.width > 0 && rect.height > 0;
                 };
                 const getText = element => (element.innerText || element.textContent || "").trim();
-                const hasLaunchText = element => getText(element).includes("Launch");
+                const hasLaunchText = element => {
+                    const t = getText(element);
+                    return t.includes("Launch") || t.includes("启动") || t.includes("运行");
+                };
                 const clickTarget = element => {
                     const target = element.closest("button, [role='button']") || element;
                     target.click();
@@ -296,7 +303,12 @@ class BrowserManager {
                     if (!isVisible(control)) continue;
 
                     const ariaLabel = control.getAttribute("aria-label") || "";
-                    if (hasLaunchText(control) || ariaLabel.includes("Launch")) {
+                    if (
+                        hasLaunchText(control) ||
+                        ariaLabel.includes("Launch") ||
+                        ariaLabel.includes("启动") ||
+                        ariaLabel.includes("运行")
+                    ) {
                         return clickTarget(control);
                     }
                 }
@@ -336,13 +348,19 @@ class BrowserManager {
                 };
                 const getText = element => (element.innerText || element.textContent || "").trim();
 
+                // eslint-disable-next-line no-undef
                 const buttons = Array.from(document.querySelectorAll("button, div[role='button'], a[role='button']"));
 
                 // 1. Check for modal/dialog confirming "Remix app"
                 for (const btn of buttons) {
                     if (!isVisible(btn)) continue;
                     const text = getText(btn);
-                    if (text === "Remix app" || text.includes("Remix app")) {
+                    if (
+                        text.includes("Remix app") ||
+                        text.includes("派生应用") ||
+                        text.includes("创建副本") ||
+                        (text.includes("Remix") && btn.closest("mat-dialog-container, .cdk-overlay-pane, .mat-mdc-dialog-container"))
+                    ) {
                         btn.click();
                         return "Remix app (dialog confirmation)";
                     }
@@ -353,11 +371,16 @@ class BrowserManager {
                     if (!isVisible(btn)) continue;
                     const text = getText(btn);
                     const aria = btn.getAttribute("aria-label") || "";
-                    if (text === "Remix" || aria.includes("Remix") || text.startsWith("Remix")) {
+                    if (
+                        text.includes("Remix") ||
+                        aria.toLowerCase().includes("remix") ||
+                        text.includes("派生") ||
+                        text.includes("分支")
+                    ) {
                         // Skip if it is within prompt input toolbar
                         if (btn.closest(".prompt-input, .input-container, textarea")) continue;
                         btn.click();
-                        return "Remix (header action)";
+                        return `Remix (header action: "${text || aria}")`;
                     }
                 }
 
@@ -375,6 +398,93 @@ class BrowserManager {
             this.logger.debug(`${logPrefix} Notice checking Remix button: ${error.message}`);
         }
 
+        return false;
+    }
+
+    async _dismissWelcomeDialogIfVisible(page, logPrefix = "[Browser]") {
+        try {
+            const dismissed = await page.evaluate(() => {
+                const isVisible = el => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+
+                // 1. Look for g1-welcome-dialog or any mat-dialog-container
+                // eslint-disable-next-line no-undef
+                const welcomeDialog = document.querySelector("#g1-welcome-dialog, ms-g1-welcome-dialog, mat-dialog-container");
+                if (welcomeDialog) {
+                    const btn = welcomeDialog.querySelector(
+                        "button.ms-button-primary, button[ms-button], .mat-mdc-dialog-actions button, button[aria-label='关闭对话框'], button[aria-label='Close dialog']"
+                    );
+                    if (btn && isVisible(btn)) {
+                        btn.click();
+                        return "Welcome Dialog Button (.ms-button-primary / 继续)";
+                    }
+                }
+
+                // 2. Scan buttons for continue / terms acceptance texts in multiple languages
+                const targetTexts = [
+                    "继续", "Continue", "Get started", "I agree", "同意并继续",
+                    "下一步", "Got it", "我知道了", "确定", "Continue to the app", "Skip"
+                ];
+                // eslint-disable-next-line no-undef
+                const buttons = Array.from(document.querySelectorAll("button, div[role='button']"));
+                for (const b of buttons) {
+                    if (!isVisible(b)) continue;
+                    const text = (b.innerText || b.textContent || "").trim();
+                    const aria = (b.getAttribute("aria-label") || "").trim();
+                    if (targetTexts.includes(text) || aria === "关闭对话框" || aria === "Close dialog") {
+                        b.click();
+                        return `Dialog Button ("${text || aria}")`;
+                    }
+                }
+
+                return null;
+            });
+
+            if (dismissed) {
+                this.logger.info(`${logPrefix} 🛡️ Automatically dismissed modal/dialog: ${dismissed}`);
+                return true;
+            }
+        } catch (error) {
+            if (this._isCriticalPageError(error)) {
+                throw error;
+            }
+            this.logger.debug(`${logPrefix} Notice checking welcome dialog: ${error.message}`);
+        }
+        return false;
+    }
+
+    async _clickRetryButtonIfVisible(page, logPrefix = "[Browser]") {
+        try {
+            const clicked = await page.evaluate(() => {
+                const isVisible = el => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                // eslint-disable-next-line no-undef
+                const buttons = Array.from(document.querySelectorAll("button, a[role='button']"));
+                for (const b of buttons) {
+                    if (!isVisible(b)) continue;
+                    const text = (b.innerText || b.textContent || "").trim();
+                    if (text === "Retry" || text === "重试" || text.includes("Retry") || text.includes("重试")) {
+                        b.click();
+                        return text;
+                    }
+                }
+                return null;
+            });
+            if (clicked) {
+                this.logger.info(`${logPrefix} 🔄 Clicked "${clicked}" button to reload failed applet!`);
+                return true;
+            }
+        } catch (error) {
+            if (this._isCriticalPageError(error)) {
+                throw error;
+            }
+        }
         return false;
     }
 
@@ -423,30 +533,47 @@ class BrowserManager {
                     return false;
                 }
 
+                // 1. Auto-dismiss welcome dialog / Terms of Service modal
+                const welcomeDismissed = await this._dismissWelcomeDialogIfVisible(page, logPrefix);
+                if (welcomeDismissed) {
+                    await page.waitForTimeout(1000);
+                    await this._clickRetryButtonIfVisible(page, logPrefix);
+                }
+
                 if (!continueClicked) {
-                    const continueText = "Continue to the app";
-                    continueClicked = await this._clickButtonByTextIfVisible(
-                        page,
-                        continueText,
-                        logPrefix,
-                        `popup "${continueText}"`
-                    );
-                    if (continueClicked) {
-                        this.logger.info(`${logPrefix} Found "${continueText}" button, clicking...`);
+                    const continueTexts = ["Continue to the app", "继续", "Continue", "Get started"];
+                    for (const ct of continueTexts) {
+                        continueClicked = await this._clickButtonByTextIfVisible(
+                            page,
+                            ct,
+                            logPrefix,
+                            `popup "${ct}"`
+                        );
+                        if (continueClicked) {
+                            this.logger.info(`${logPrefix} Found "${ct}" button, clicking...`);
+                            break;
+                        }
                     }
                 }
 
                 if (!skipClicked) {
-                    const skipText = "Skip";
-                    skipClicked = await this._clickButtonByTextIfVisible(
-                        page,
-                        skipText,
-                        logPrefix,
-                        `popup "${skipText}"`
-                    );
-                    if (skipClicked) {
-                        this.logger.info(`${logPrefix} Found "${skipText}" button, clicking...`);
+                    const skipTexts = ["Skip", "跳过", "暂不"];
+                    for (const st of skipTexts) {
+                        skipClicked = await this._clickButtonByTextIfVisible(
+                            page,
+                            st,
+                            logPrefix,
+                            `popup "${st}"`
+                        );
+                        if (skipClicked) {
+                            this.logger.info(`${logPrefix} Found "${st}" button, clicking...`);
+                            break;
+                        }
                     }
+                }
+
+                if (iteration % 3 === 0) {
+                    await this._clickRetryButtonIfVisible(page, logPrefix);
                 }
 
                 if (iteration % 5 === 0) {
@@ -1070,6 +1197,25 @@ class BrowserManager {
 
                     // 4. Popup & Overlay Cleanup
                     await page.evaluate(() => {
+                        const isVisible = el => {
+                            if (!el) return false;
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0;
+                        };
+
+                        // Check welcome dialog explicitly first
+                        // eslint-disable-next-line no-undef
+                        const welcomeDialog = document.querySelector("#g1-welcome-dialog, ms-g1-welcome-dialog, mat-dialog-container");
+                        if (welcomeDialog) {
+                            const btn = welcomeDialog.querySelector(
+                                "button.ms-button-primary, button[ms-button], .mat-mdc-dialog-actions button, button[aria-label='关闭对话框'], button[aria-label='Close dialog']"
+                            );
+                            if (btn && isVisible(btn)) {
+                                console.log("[ProxyClient] HealthMonitor clicking welcome dialog primary button");
+                                btn.click();
+                            }
+                        }
+
                         const blockers = [
                             "div.cdk-overlay-backdrop",
                             "div.cdk-overlay-container",
@@ -1084,32 +1230,44 @@ class BrowserManager {
                             "Not now",
                             "Continue to the app",
                             "Skip",
+                            "继续",
+                            "重试",
+                            "重新加载",
+                            "我知道了",
+                            "确定",
+                            "下一步",
+                            "同意并继续",
                         ];
-
-                        // Remove passive blockers
-                        blockers.forEach(selector => {
-                            // eslint-disable-next-line no-undef
-                            document.querySelectorAll(selector).forEach(el => el.remove());
-                        });
 
                         // Click active buttons if visible
                         // eslint-disable-next-line no-undef
-                        document.querySelectorAll("button").forEach(btn => {
-                            // Check if the element occupies space (simple visibility check)
-                            const rect = btn.getBoundingClientRect();
-                            const isVisible = rect.width > 0 && rect.height > 0;
-
-                            if (isVisible) {
-                                const text = (btn.innerText || "").trim();
-                                const ariaLabel = btn.getAttribute("aria-label");
+                        document.querySelectorAll("button, a[role='button'], div[role='button']").forEach(btn => {
+                            if (isVisible(btn)) {
+                                const text = (btn.innerText || btn.textContent || "").trim();
+                                const ariaLabel = (btn.getAttribute("aria-label") || "").trim();
 
                                 // Match text or aria-label
-                                if (targetTexts.includes(text) || ariaLabel === "Close") {
-                                    console.log(`[ProxyClient] HealthMonitor clicking: ${text || "Close Button"}`);
+                                if (
+                                    targetTexts.includes(text) ||
+                                    ariaLabel === "Close" ||
+                                    ariaLabel === "Close dialog" ||
+                                    ariaLabel === "关闭对话框" ||
+                                    ariaLabel === "关闭"
+                                ) {
+                                    console.log(`[ProxyClient] HealthMonitor clicking: ${text || ariaLabel || "Close Button"}`);
                                     btn.click();
                                 }
                             }
                         });
+
+                        // Remove passive backdrop blockers only if no active welcome dialog
+                        // eslint-disable-next-line no-undef
+                        if (!document.querySelector("#g1-welcome-dialog")) {
+                            blockers.forEach(selector => {
+                                // eslint-disable-next-line no-undef
+                                document.querySelectorAll(selector).forEach(el => el.remove());
+                            });
+                        }
                     });
                 } catch (err) {
                     // Silent catch to prevent log spamming on navigation
