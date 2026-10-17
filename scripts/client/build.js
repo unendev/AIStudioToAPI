@@ -382,9 +382,30 @@ class RequestProcessor {
             }
         }
 
+        // Ensure Google API consumer identity (API Key) from AI Studio environment is attached
+        const envApiKey = this._getEnvApiKey();
+        if (envApiKey && !cleanPath.includes("key=") && this.targetDomain.includes("generativelanguage")) {
+            const separator = cleanPath.includes("?") ? "&" : "?";
+            cleanPath = `${cleanPath}${separator}key=${encodeURIComponent(envApiKey)}`;
+        }
+
         const finalUrl = `https://${targetHost}/${cleanPath}`;
         Logger.debug(`Constructed URL: ${pathAndQuery} -> ${finalUrl}`);
         return finalUrl;
+    }
+
+    _getEnvApiKey() {
+        try {
+            return (
+                (typeof process !== "undefined" && process?.env?.API_KEY) ||
+                (typeof process !== "undefined" && process?.env?.GEMINI_API_KEY) ||
+                (typeof window !== "undefined" && window?.process?.env?.API_KEY) ||
+                (typeof window !== "undefined" && window?.process?.env?.GEMINI_API_KEY) ||
+                null
+            );
+        } catch (_) {
+            return null;
+        }
     }
 
     _removeStructuredOutputConfig(bodyObj, { preserveResponseFormat = false } = {}) {
@@ -426,6 +447,11 @@ class RequestProcessor {
             method: requestSpec.method,
             signal,
         };
+
+        const envApiKey = this._getEnvApiKey();
+        if (envApiKey && !config.headers["x-goog-api-key"] && !this._isUploadRequestSpec(requestSpec)) {
+            config.headers["x-goog-api-key"] = envApiKey;
+        }
 
         if (["POST", "PUT", "PATCH"].includes(requestSpec.method)) {
             if (!requestSpec.is_generative && requestSpec.body_b64) {
@@ -571,18 +597,37 @@ class RequestProcessor {
                         }
                     }
 
-                    // if raise `400 INVALID_ARGUMENT`, try to delete `thoughtSignature`
-                    // if (Array.isArray(bodyObj.contents)) {
-                    //     bodyObj.contents.forEach(msg => {
-                    //         if (Array.isArray(msg.parts)) {
-                    //             msg.parts.forEach(part => {
-                    //                 if (part.thoughtSignature) {
-                    //                     delete part.thoughtSignature;
-                    //                 }
-                    //             });
-                    //         }
-                    //     });
-                    // }
+                    // Delete fake/placeholder thoughtSignature
+                    if (Array.isArray(bodyObj.contents)) {
+                        bodyObj.contents.forEach(msg => {
+                            if (Array.isArray(msg.parts)) {
+                                msg.parts.forEach(part => {
+                                    if (part.thoughtSignature === "context_engineering_is_the_way_to_go") {
+                                        delete part.thoughtSignature;
+                                    }
+                                });
+                            }
+                        });
+                    }
+
+                    // Remove restricted or invalid safetySettings
+                    if (Array.isArray(bodyObj.safetySettings)) {
+                        bodyObj.safetySettings = bodyObj.safetySettings.filter(
+                            s => s && s.threshold !== "OFF" && s.threshold !== "BLOCK_NONE"
+                        );
+                        if (bodyObj.safetySettings.length === 0) {
+                            delete bodyObj.safetySettings;
+                        }
+                    }
+
+                    // Remove empty generationConfig if empty
+                    if (
+                        bodyObj.generationConfig &&
+                        typeof bodyObj.generationConfig === "object" &&
+                        Object.keys(bodyObj.generationConfig).length === 0
+                    ) {
+                        delete bodyObj.generationConfig;
+                    }
 
                     config.body = JSON.stringify(bodyObj);
                 } catch (e) {

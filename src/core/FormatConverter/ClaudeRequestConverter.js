@@ -77,16 +77,30 @@ class ClaudeRequestConverter extends FormatConverter {
         let systemInstruction = null;
         const googleContents = [];
 
-        // Pre-scan messages to build a map of tool_use_id -> function_name
-        // This is required because Gemini's functionResponse needs the original function name,
-        // but Claude's tool_result only provides the tool_use_id.
+        // Pre-scan messages to build:
+        // 1. tool_use_id -> function_name map (for Gemini functionResponse)
+        // 2. degradedToolIds Set (tools that lack a thoughtSignature from cache or payload)
+        // Gemini 2.5/3 requires thoughtSignature on all functionCall parts.
+        // For historical tool calls across sessions/restarts where signature is lost,
+        // we gracefully degrade the call and its matching result to conversational text
+        // so Gemini executes without 400 INVALID_ARGUMENT rejection.
         const toolIdToNameMap = new Map();
+        const degradedToolIds = new Set();
         if (claudeBody.messages && Array.isArray(claudeBody.messages)) {
             for (const message of claudeBody.messages) {
                 if (message.role === "assistant" && Array.isArray(message.content)) {
                     for (const block of message.content) {
-                        if (block.type === "tool_use" && block.id && block.name) {
-                            toolIdToNameMap.set(block.id, block.name);
+                        if (block.type === "tool_use" && block.name) {
+                            if (block.id) {
+                                toolIdToNameMap.set(block.id, block.name);
+                            }
+                            const fallbackKey = `${block.name}:${JSON.stringify(block.input || {})}`;
+                            const cachedSig = FormatConverter.getToolSignature(block.id, fallbackKey);
+                            const sig = block.thoughtSignature || block.signature || cachedSig;
+                            if (!sig) {
+                                if (block.id) degradedToolIds.add(block.id);
+                                degradedToolIds.add(fallbackKey);
+                            }
                         }
                     }
                 }
@@ -221,18 +235,38 @@ class ClaudeRequestConverter extends FormatConverter {
                 const toolResults = message.content.filter(block => block.type === "tool_result");
                 if (toolResults.length > 0) {
                     for (const toolResult of toolResults) {
-                        const convertedResult = await normalizeClaudeToolResultResponse(toolResult);
-
                         // Resolve function name using the map
                         const toolUseId = toolResult.tool_use_id;
-                        let functionName = toolIdToNameMap.get(toolUseId);
+                        const functionName = toolIdToNameMap.get(toolUseId);
 
-                        if (!functionName) {
+                        // If this tool call was degraded, or if function name is completely unresolved,
+                        // degrade the result to text context so Gemini does not reject mismatched functionResponse
+                        if ((toolUseId && degradedToolIds.has(toolUseId)) || !functionName) {
                             this.logger.warn(
-                                `[Adapter] Warning: Tool name resolution failed for ID: ${toolUseId}. outputting as unknown_function`
+                                `[Adapter] Claude tool_result for ID: ${toolUseId || "missing"} belongs to degraded/unmatched tool call. Degrading to text context.`
                             );
-                            functionName = "unknown_function";
+                            let resultText = "";
+                            if (typeof toolResult.content === "string") {
+                                resultText = toolResult.content;
+                            } else if (Array.isArray(toolResult.content)) {
+                                resultText = toolResult.content
+                                    .map(c => {
+                                        if (typeof c === "string") return c;
+                                        if (c && c.type === "text") return c.text || "";
+                                        return JSON.stringify(c);
+                                    })
+                                    .filter(Boolean)
+                                    .join("\n");
+                            } else {
+                                resultText = JSON.stringify(toolResult.content ?? "");
+                            }
+                            pendingToolParts.push({
+                                text: `[Tool Result for ${functionName || "tool"}: ${resultText}]`,
+                            });
+                            continue;
                         }
+
+                        const convertedResult = await normalizeClaudeToolResultResponse(toolResult);
 
                         pendingToolParts.push({
                             functionResponse: {
@@ -274,9 +308,23 @@ class ClaudeRequestConverter extends FormatConverter {
 
             // Handle assistant messages with tool_use
             if (message.role === "assistant" && Array.isArray(message.content)) {
-                let signatureAttachedToCall = false;
                 for (const block of message.content) {
                     if (block.type === "tool_use") {
+                        const fallbackKey = `${block.name}:${JSON.stringify(block.input || {})}`;
+                        const cachedSig = FormatConverter.getToolSignature(block.id, fallbackKey);
+                        const sig = block.thoughtSignature || block.signature || cachedSig;
+
+                        // Uncached historical tool call without thoughtSignature: degrade to text
+                        if (!sig || (block.id && degradedToolIds.has(block.id)) || degradedToolIds.has(fallbackKey)) {
+                            this.logger.warn(
+                                `[Adapter] Claude assistant tool_use "${block.name}" (id: ${block.id || "none"}) has no thoughtSignature. Degrading historical tool call to text context.`
+                            );
+                            googleParts.push({
+                                text: `[Tool Call: ${block.name}(${JSON.stringify(block.input || {})})]`,
+                            });
+                            continue;
+                        }
+
                         const functionCallPart = {
                             functionCall: {
                                 args: block.input || {},
@@ -284,10 +332,7 @@ class ClaudeRequestConverter extends FormatConverter {
                                 name: block.name,
                             },
                         };
-                        if (!signatureAttachedToCall) {
-                            functionCallPart.thoughtSignature = FormatConverter.DUMMY_THOUGHT_SIGNATURE;
-                            signatureAttachedToCall = true;
-                        }
+                        functionCallPart.thoughtSignature = sig;
                         googleParts.push(functionCallPart);
                     } else if (block.type === "thinking") {
                         // Claude thinking block -> Gemini thought
@@ -472,7 +517,14 @@ class ClaudeRequestConverter extends FormatConverter {
             }
         }
 
-        googleRequest.generationConfig = generationConfig;
+        // Clean undefined keys
+        Object.keys(generationConfig).forEach(k => {
+            if (generationConfig[k] === undefined) delete generationConfig[k];
+        });
+
+        if (Object.keys(generationConfig).length > 0) {
+            googleRequest.generationConfig = generationConfig;
+        }
 
         // Convert Claude tools to Gemini functionDeclarations
         const builtInToolChoiceNames = new Set();

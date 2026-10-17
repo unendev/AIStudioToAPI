@@ -247,6 +247,14 @@ class ResponsesNonStreamResponseConverter extends FormatConverter {
                         typeof funcCall.id === "string" && funcCall.id
                             ? funcCall.id
                             : `call_${this._generateRequestId()}`;
+                    const sig = part.thoughtSignature || part.signature;
+                    if (sig) {
+                        const fallbackKey = `${funcCall.name}:${JSON.stringify(funcCall.args || {})}`;
+                        FormatConverter.recordToolSignature(callId, sig, fallbackKey);
+                        if (funcCall.id) {
+                            FormatConverter.recordToolSignature(funcCall.id, sig);
+                        }
+                    }
                     output.push({
                         [isCustom ? "input" : "arguments"]: toolInput,
                         call_id: callId,

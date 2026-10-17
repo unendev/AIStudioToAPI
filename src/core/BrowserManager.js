@@ -282,6 +282,7 @@ class BrowserManager {
             this.logger.debug(`${logPrefix} 🔍 Checking for Launch button...`);
 
             const clicked = await page.evaluate(() => {
+                /* global window, document, MouseEvent */
                 const isVisible = element => {
                     const rect = element.getBoundingClientRect();
                     return rect.width > 0 && rect.height > 0;
@@ -291,11 +292,40 @@ class BrowserManager {
                     const t = getText(element);
                     return t.includes("Launch") || t.includes("启动") || t.includes("运行");
                 };
-                const clickTarget = element => {
+                const triggerClick = element => {
                     const target = element.closest("button, [role='button']") || element;
-                    target.click();
+                    try {
+                        target.scrollIntoView({ block: "center", inline: "center" });
+                    } catch (_) {
+                        /* ignore */
+                    }
+                    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(evtName => {
+                        try {
+                            target.dispatchEvent(
+                                new MouseEvent(evtName, { bubbles: true, cancelable: true, view: window })
+                            );
+                        } catch (_) {
+                            /* ignore */
+                        }
+                    });
+                    if (typeof target.click === "function") {
+                        try {
+                            target.click();
+                        } catch (_) {
+                            /* ignore */
+                        }
+                    }
                     return true;
                 };
+
+                // Direct selector match for modern AI Studio launch button
+                // eslint-disable-next-line no-undef
+                const directLaunch = document.querySelector(
+                    ".launch-button, button.launch-button, [aria-label*='Launch'], [aria-label*='启动']"
+                );
+                if (directLaunch && isVisible(directLaunch)) {
+                    return triggerClick(directLaunch);
+                }
 
                 // eslint-disable-next-line no-undef
                 const controls = Array.from(document.querySelectorAll("button, div[role='button']"));
@@ -307,9 +337,10 @@ class BrowserManager {
                         hasLaunchText(control) ||
                         ariaLabel.includes("Launch") ||
                         ariaLabel.includes("启动") ||
-                        ariaLabel.includes("运行")
+                        ariaLabel.includes("运行") ||
+                        control.classList.contains("launch-button")
                     ) {
-                        return clickTarget(control);
+                        return triggerClick(control);
                     }
                 }
 
@@ -317,8 +348,8 @@ class BrowserManager {
                 const spans = Array.from(document.querySelectorAll("button span, [role='button'] span"));
                 for (const span of spans) {
                     if (!isVisible(span)) continue;
-                    if (hasLaunchText(span)) {
-                        return clickTarget(span);
+                    if (hasLaunchText(span) || span.innerText.includes("rocket_launch")) {
+                        return triggerClick(span);
                     }
                 }
 
@@ -342,45 +373,109 @@ class BrowserManager {
     async _clickRemixButtonIfVisible(page, logPrefix = "[Browser]") {
         try {
             const clicked = await page.evaluate(() => {
+                if (window.__aistudio_remix_confirmed) return null;
+
                 const isVisible = element => {
+                    if (!element) return false;
                     const rect = element.getBoundingClientRect();
                     return rect.width > 0 && rect.height > 0;
                 };
                 const getText = element => (element.innerText || element.textContent || "").trim();
 
-                // eslint-disable-next-line no-undef
-                const buttons = Array.from(document.querySelectorAll("button, div[role='button'], a[role='button']"));
+                const triggerClick = element => {
+                    try {
+                        element.scrollIntoView({ block: "center", inline: "center" });
+                    } catch (_) {
+                        /* ignore */
+                    }
+                    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(evtName => {
+                        try {
+                            element.dispatchEvent(
+                                new MouseEvent(evtName, { bubbles: true, cancelable: true, view: window })
+                            );
+                        } catch (_) {
+                            /* ignore */
+                        }
+                    });
+                    if (typeof element.click === "function") {
+                        try {
+                            element.click();
+                        } catch (_) {
+                            /* ignore */
+                        }
+                    }
+                };
 
                 // 1. Check for modal/dialog confirming "Remix app"
-                for (const btn of buttons) {
-                    if (!isVisible(btn)) continue;
-                    const text = getText(btn);
-                    if (
-                        text.includes("Remix app") ||
-                        text.includes("派生应用") ||
-                        text.includes("创建副本") ||
-                        (text.includes("Remix") && btn.closest("mat-dialog-container, .cdk-overlay-pane, .mat-mdc-dialog-container"))
-                    ) {
-                        btn.click();
-                        return "Remix app (dialog confirmation)";
+                const dialogs = document.querySelectorAll(
+                    "mat-dialog-container, .cdk-overlay-pane, .mat-mdc-dialog-container, [role='dialog'], dialog"
+                );
+                for (const dialog of dialogs) {
+                    if (!isVisible(dialog)) continue;
+                    const dialogButtons = Array.from(
+                        dialog.querySelectorAll("button, div[role='button'], a[role='button']")
+                    );
+                    for (const btn of dialogButtons) {
+                        if (!isVisible(btn)) continue;
+                        const text = getText(btn);
+                        if (
+                            text.includes("Remix app") ||
+                            text.includes("派生应用") ||
+                            text.includes("创建副本") ||
+                            text === "Remix" ||
+                            text === "派生" ||
+                            text === "确认" ||
+                            text === "Confirm"
+                        ) {
+                            triggerClick(btn);
+                            window.__aistudio_remix_confirmed = true;
+                            return "Remix app (dialog confirmation)";
+                        }
                     }
                 }
 
-                // 2. Check for top header Remix button
+                if (window.__aistudio_remix_clicked) return null;
+
+                // 2. Only check for Top Header Remix button if the app is an external untrusted app
+                const isThirdPartyApp =
+                    document.querySelector(".safety-info-container") ||
+                    (document.body &&
+                        document.body.innerText &&
+                        (document.body.innerText.includes("This app was developed by another user") ||
+                            document.body.innerText.includes("Remix this app to make changes") ||
+                            document.body.innerText.includes("Remix to make this app your own")));
+
+                if (!isThirdPartyApp) {
+                    return null;
+                }
+
+                // Look ONLY in the top header (rect.top < 120px) to strictly avoid the bottom prompt input bar!
+                const buttons = Array.from(
+                    document.querySelectorAll("header button, nav button, button, div[role='button']")
+                );
                 for (const btn of buttons) {
                     if (!isVisible(btn)) continue;
+
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.top > 120) continue;
+
+                    if (btn.closest("ms-prompt-input, .prompt-input, .input-container, textarea, form")) continue;
+
                     const text = getText(btn);
-                    const aria = btn.getAttribute("aria-label") || "";
-                    if (
+                    const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+                    const title = (btn.getAttribute("title") || "").toLowerCase();
+
+                    const matchesRemix =
+                        text === "Remix" ||
                         text.includes("Remix") ||
-                        aria.toLowerCase().includes("remix") ||
-                        text.includes("派生") ||
-                        text.includes("分支")
-                    ) {
-                        // Skip if it is within prompt input toolbar
-                        if (btn.closest(".prompt-input, .input-container, textarea")) continue;
-                        btn.click();
-                        return `Remix (header action: "${text || aria}")`;
+                        aria.includes("remix") ||
+                        title.includes("remix") ||
+                        text.includes("派生");
+
+                    if (matchesRemix) {
+                        triggerClick(btn);
+                        window.__aistudio_remix_clicked = true;
+                        return `Top Header Remix button: "${text || aria || title}"`;
                     }
                 }
 
@@ -388,7 +483,7 @@ class BrowserManager {
             });
 
             if (clicked) {
-                this.logger.info(`${logPrefix} 🚀 Automatically clicked "${clicked}" to fork app into account!`);
+                this.logger.info(`${logPrefix} 🚀 Successfully triggered: "${clicked}"`);
                 return true;
             }
         } catch (error) {
@@ -412,7 +507,9 @@ class BrowserManager {
 
                 // 1. Look for g1-welcome-dialog or any mat-dialog-container
                 // eslint-disable-next-line no-undef
-                const welcomeDialog = document.querySelector("#g1-welcome-dialog, ms-g1-welcome-dialog, mat-dialog-container");
+                const welcomeDialog = document.querySelector(
+                    "#g1-welcome-dialog, ms-g1-welcome-dialog, mat-dialog-container"
+                );
                 if (welcomeDialog) {
                     const btn = welcomeDialog.querySelector(
                         "button.ms-button-primary, button[ms-button], .mat-mdc-dialog-actions button, button[aria-label='关闭对话框'], button[aria-label='Close dialog']"
@@ -425,8 +522,17 @@ class BrowserManager {
 
                 // 2. Scan buttons for continue / terms acceptance texts in multiple languages
                 const targetTexts = [
-                    "继续", "Continue", "Get started", "I agree", "同意并继续",
-                    "下一步", "Got it", "我知道了", "确定", "Continue to the app", "Skip"
+                    "继续",
+                    "Continue",
+                    "Get started",
+                    "I agree",
+                    "同意并继续",
+                    "下一步",
+                    "Got it",
+                    "我知道了",
+                    "确定",
+                    "Continue to the app",
+                    "Skip",
                 ];
                 // eslint-disable-next-line no-undef
                 const buttons = Array.from(document.querySelectorAll("button, div[role='button']"));
@@ -543,12 +649,7 @@ class BrowserManager {
                 if (!continueClicked) {
                     const continueTexts = ["Continue to the app", "继续", "Continue", "Get started"];
                     for (const ct of continueTexts) {
-                        continueClicked = await this._clickButtonByTextIfVisible(
-                            page,
-                            ct,
-                            logPrefix,
-                            `popup "${ct}"`
-                        );
+                        continueClicked = await this._clickButtonByTextIfVisible(page, ct, logPrefix, `popup "${ct}"`);
                         if (continueClicked) {
                             this.logger.info(`${logPrefix} Found "${ct}" button, clicking...`);
                             break;
@@ -559,12 +660,7 @@ class BrowserManager {
                 if (!skipClicked) {
                     const skipTexts = ["Skip", "跳过", "暂不"];
                     for (const st of skipTexts) {
-                        skipClicked = await this._clickButtonByTextIfVisible(
-                            page,
-                            st,
-                            logPrefix,
-                            `popup "${st}"`
-                        );
+                        skipClicked = await this._clickButtonByTextIfVisible(page, st, logPrefix, `popup "${st}"`);
                         if (skipClicked) {
                             this.logger.info(`${logPrefix} Found "${st}" button, clicking...`);
                             break;
@@ -1205,7 +1301,9 @@ class BrowserManager {
 
                         // Check welcome dialog explicitly first
                         // eslint-disable-next-line no-undef
-                        const welcomeDialog = document.querySelector("#g1-welcome-dialog, ms-g1-welcome-dialog, mat-dialog-container");
+                        const welcomeDialog = document.querySelector(
+                            "#g1-welcome-dialog, ms-g1-welcome-dialog, mat-dialog-container"
+                        );
                         if (welcomeDialog) {
                             const btn = welcomeDialog.querySelector(
                                 "button.ms-button-primary, button[ms-button], .mat-mdc-dialog-actions button, button[aria-label='关闭对话框'], button[aria-label='Close dialog']"
@@ -1254,7 +1352,9 @@ class BrowserManager {
                                     ariaLabel === "关闭对话框" ||
                                     ariaLabel === "关闭"
                                 ) {
-                                    console.log(`[ProxyClient] HealthMonitor clicking: ${text || ariaLabel || "Close Button"}`);
+                                    console.log(
+                                        `[ProxyClient] HealthMonitor clicking: ${text || ariaLabel || "Close Button"}`
+                                    );
                                     btn.click();
                                 }
                             }

@@ -601,8 +601,11 @@ class ResponsesRequestConverter extends FormatConverter {
                                 name: toGeminiFunctionName(item.name, item.namespace),
                             },
                         };
-                        if (!pendingModelParts.some(part => part.functionCall)) {
-                            functionCallPart.thoughtSignature = FormatConverter.DUMMY_THOUGHT_SIGNATURE;
+                        const fallbackKey = `${functionCallPart.functionCall.name}:${JSON.stringify(functionCallPart.functionCall.args || {})}`;
+                        const cachedSig = FormatConverter.getToolSignature(item.call_id || item.id, fallbackKey);
+                        const sig = item.thoughtSignature || item.signature || cachedSig;
+                        if (sig) {
+                            functionCallPart.thoughtSignature = sig;
                         }
                         if (typeof item.call_id === "string" && item.call_id) {
                             functionCallPart.functionCall.id = item.call_id;
@@ -976,6 +979,17 @@ class ResponsesRequestConverter extends FormatConverter {
                     "[Adapter] Set responseFormat.text.mimeType to APPLICATION_JSON for OpenAI Response API json_object format"
                 );
             }
+        }
+
+        // Clean undefined keys
+        Object.keys(generationConfig).forEach(k => {
+            if (generationConfig[k] === undefined) delete generationConfig[k];
+        });
+
+        if (Object.keys(generationConfig).length > 0) {
+            googleRequest.generationConfig = generationConfig;
+        } else {
+            delete googleRequest.generationConfig;
         }
 
         this._finalizeGoogleRequest(googleRequest, {

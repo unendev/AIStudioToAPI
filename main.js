@@ -8,7 +8,7 @@
 // Load environment variables based on NODE_ENV
 const path = require("path");
 const envFile = process.env.NODE_ENV === "production" ? ".env" : ".env.development";
-require("dotenv").config({ path: path.resolve(__dirname, envFile) });
+require("dotenv").config({ override: true, path: path.resolve(__dirname, envFile) });
 
 // Process exception shields to prevent abrupt terminations from browser socket resets
 process.on("uncaughtException", err => {

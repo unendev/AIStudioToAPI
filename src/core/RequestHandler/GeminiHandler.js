@@ -800,8 +800,23 @@ class GeminiHandler extends RetryHandler {
         this.formatConverter.ensureServerSideToolInvocations(bodyObj, "[Proxy]");
 
         // Apply safety settings for native Google requests (only if not already provided)
-        if (req.method === "POST" && bodyObj && bodyObj.contents && !bodyObj.safetySettings) {
-            bodyObj.safetySettings = this.formatConverter.getDefaultSafetySettings();
+        if (req.method === "POST" && bodyObj && bodyObj.contents) {
+            const configuredThreshold = this.config?.safetySettingsThreshold;
+            if (
+                !bodyObj.safetySettings &&
+                configuredThreshold &&
+                configuredThreshold !== "OFF" &&
+                configuredThreshold !== "BLOCK_NONE"
+            ) {
+                bodyObj.safetySettings = this.formatConverter.getDefaultSafetySettings();
+            } else if (Array.isArray(bodyObj.safetySettings)) {
+                bodyObj.safetySettings = bodyObj.safetySettings.filter(
+                    setting => setting && setting.threshold !== "OFF" && setting.threshold !== "BLOCK_NONE"
+                );
+                if (bodyObj.safetySettings.length === 0) {
+                    delete bodyObj.safetySettings;
+                }
+            }
         }
 
         this.logger.debug(

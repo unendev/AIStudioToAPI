@@ -668,7 +668,20 @@ class ClaudeResponseConverter extends FormatConverter {
                     // Tool use
                     closeThinkingBlock();
                     closeTextBlock();
-                    const toolUseId = `toolu_${this._generateRequestId()}`;
+                    const toolUseId =
+                        typeof part.functionCall.id === "string" && part.functionCall.id
+                            ? part.functionCall.id
+                            : `toolu_${this._generateRequestId()}`;
+
+                    const sig = part.thoughtSignature || part.signature;
+                    if (sig) {
+                        const fallbackKey = `${part.functionCall.name}:${JSON.stringify(part.functionCall.args || {})}`;
+                        FormatConverter.recordToolSignature(toolUseId, sig, fallbackKey);
+                        if (part.functionCall.id) {
+                            FormatConverter.recordToolSignature(part.functionCall.id, sig);
+                        }
+                    }
+
                     events.push({
                         content_block: {
                             caller: { type: "direct" },
@@ -676,6 +689,7 @@ class ClaudeResponseConverter extends FormatConverter {
                             input: {},
                             name: part.functionCall.name,
                             type: "tool_use",
+                            ...(sig ? { signature: sig, thoughtSignature: sig } : {}),
                         },
                         index: streamState.contentBlockIndex,
                         type: "content_block_start",
@@ -824,12 +838,27 @@ class ClaudeResponseConverter extends FormatConverter {
                     content.push(...serverTools.blocks);
                 } else if (part.functionCall) {
                     hasToolUse = true;
+                    const toolUseId =
+                        typeof part.functionCall.id === "string" && part.functionCall.id
+                            ? part.functionCall.id
+                            : `toolu_${this._generateRequestId()}`;
+
+                    const sig = part.thoughtSignature || part.signature;
+                    if (sig) {
+                        const fallbackKey = `${part.functionCall.name}:${JSON.stringify(part.functionCall.args || {})}`;
+                        FormatConverter.recordToolSignature(toolUseId, sig, fallbackKey);
+                        if (part.functionCall.id) {
+                            FormatConverter.recordToolSignature(part.functionCall.id, sig);
+                        }
+                    }
+
                     content.push({
                         caller: { type: "direct" },
-                        id: `toolu_${this._generateRequestId()}`,
+                        id: toolUseId,
                         input: part.functionCall.args || {},
                         name: part.functionCall.name,
                         type: "tool_use",
+                        ...(sig ? { signature: sig, thoughtSignature: sig } : {}),
                     });
                 }
             }

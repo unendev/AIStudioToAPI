@@ -35,7 +35,6 @@ function parseAiStudioAppUrl(value) {
     }
 }
 
-
 /**
  * Configuration Loader Module
  * Responsible for loading system configuration from environment variables
@@ -66,7 +65,7 @@ class ConfigLoader {
             maxContexts: 1,
             maxRetries: 3,
             retryDelay: 2000,
-            safetySettingsThreshold: "OFF",
+            safetySettingsThreshold: "BLOCK_NONE",
             streamingMode: "real",
             streamTimeoutMs: 60000,
             switchOnUses: 40,
@@ -153,7 +152,7 @@ class ConfigLoader {
                 "OFF",
             ]);
             if (allowedThresholds.has(rawThreshold)) {
-                config.safetySettingsThreshold = rawThreshold;
+                config.safetySettingsThreshold = rawThreshold === "OFF" ? "BLOCK_NONE" : rawThreshold;
             } else {
                 this.logger.warn(
                     `[Config] Invalid SAFETY_SETTINGS_THRESHOLD "${process.env.SAFETY_SETTINGS_THRESHOLD}", falling back to ${config.safetySettingsThreshold}.`

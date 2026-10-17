@@ -27,6 +27,16 @@ configs/auth/
 auth-*.json
 users.csv
 cache/
+cookie.txt
+*cookie*
+inject_script.js
+scripts/harvest_from_chrome.js
+scripts/import_cookies.js
+scripts/inject_payload.js
+scripts/inject_to_cloud.js
+scripts/prepare_injection.js
+test_api.js
+test_tool_signature.js
 
 # Usage statistics data
 data/

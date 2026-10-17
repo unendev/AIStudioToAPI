@@ -52,6 +52,7 @@ class ChatCompletionsConverter extends FormatConverter {
         // assistant tool call so the Gemini functionCall/functionResponse pair keeps
         // the same name and id, including for parallel calls.
         const toolCallIdToName = new Map();
+        const degradedToolCallIds = new Set();
         for (const message of conversationMessages) {
             if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
             for (const toolCall of message.tool_calls) {
@@ -59,6 +60,23 @@ class ChatCompletionsConverter extends FormatConverter {
                 const functionName = toolCall?.function?.name;
                 if (typeof toolCallId === "string" && toolCallId && typeof functionName === "string" && functionName) {
                     toolCallIdToName.set(toolCallId, functionName);
+
+                    let args;
+                    try {
+                        const rawArgs = Object.prototype.hasOwnProperty.call(toolCall.function, "arguments")
+                            ? toolCall.function["arguments"]
+                            : undefined;
+                        args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
+                    } catch {
+                        args = {};
+                    }
+                    const fallbackKey = `${functionName}:${JSON.stringify(args || {})}`;
+                    const cachedSig = FormatConverter.getToolSignature(toolCallId, fallbackKey);
+                    const sig = toolCall.thoughtSignature || toolCall.signature || cachedSig;
+                    if (!sig) {
+                        degradedToolCallIds.add(toolCallId);
+                        degradedToolCallIds.add(fallbackKey);
+                    }
                 }
             }
         }
@@ -144,10 +162,18 @@ class ChatCompletionsConverter extends FormatConverter {
                 const toolCallId =
                     typeof message.tool_call_id === "string" && message.tool_call_id ? message.tool_call_id : null;
                 const functionName = message.name || (toolCallId ? toolCallIdToName.get(toolCallId) : null);
-                if (!functionName) {
+
+                // If tool call was degraded or name is missing, degrade result to text context
+                if ((toolCallId && degradedToolCallIds.has(toolCallId)) || !functionName) {
                     this.logger.warn(
-                        `[Adapter] Unable to resolve function name for OpenAI tool result (tool_call_id: ${toolCallId || "missing"}), using unknown_function`
+                        `[Adapter] OpenAI tool response for tool_call_id: ${toolCallId || "missing"} belongs to unsigned/unmatched tool call. Degrading to text context.`
                     );
+                    const contentText =
+                        typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+                    pendingToolParts.push({
+                        text: `[Tool Result for ${functionName || "tool"}: ${contentText}]`,
+                    });
+                    continue;
                 }
 
                 // Add to buffer instead of pushing directly
@@ -170,8 +196,6 @@ class ChatCompletionsConverter extends FormatConverter {
             // Handle assistant messages with tool_calls
             if (message.role === "assistant" && message.tool_calls && Array.isArray(message.tool_calls)) {
                 // Convert OpenAI tool_calls to Gemini functionCall
-                // For Gemini 3: thoughtSignature should only be on the FIRST functionCall part
-                let signatureAttachedToCall = false;
                 for (const toolCall of message.tool_calls) {
                     // Avoid accessing Function.prototype.arguments in strict mode (will throw)
                     if (
@@ -193,6 +217,25 @@ class ChatCompletionsConverter extends FormatConverter {
                             args = {};
                         }
 
+                        const fallbackKey = `${toolCall.function.name}:${JSON.stringify(args || {})}`;
+                        const cachedSig = FormatConverter.getToolSignature(toolCall.id, fallbackKey);
+                        const sig = toolCall.thoughtSignature || toolCall.signature || cachedSig;
+
+                        // Uncached historical tool call without thoughtSignature: degrade to text
+                        if (
+                            !sig ||
+                            (toolCall.id && degradedToolCallIds.has(toolCall.id)) ||
+                            degradedToolCallIds.has(fallbackKey)
+                        ) {
+                            this.logger.warn(
+                                `[Adapter] OpenAI assistant tool_call "${toolCall.function.name}" (id: ${toolCall.id || "none"}) has no thoughtSignature. Degrading historical tool call to text context.`
+                            );
+                            googleParts.push({
+                                text: `[Tool Call: ${toolCall.function.name}(${JSON.stringify(args || {})})]`,
+                            });
+                            continue;
+                        }
+
                         const functionCallPart = {
                             functionCall: {
                                 args,
@@ -200,15 +243,7 @@ class ChatCompletionsConverter extends FormatConverter {
                                 name: toolCall.function.name,
                             },
                         };
-                        // Pass back thoughtSignature only on the FIRST functionCall
-                        // [PLACEHOLDER MODE] - Use dummy signature to skip validation for official Gemini API testing
-                        if (!signatureAttachedToCall) {
-                            functionCallPart.thoughtSignature = FormatConverter.DUMMY_THOUGHT_SIGNATURE;
-                            signatureAttachedToCall = true;
-                            this.logger.debug(
-                                `[Adapter] Using dummy thoughtSignature for first functionCall: ${toolCall.function.name}`
-                            );
-                        }
+                        functionCallPart.thoughtSignature = sig;
                         googleParts.push(functionCallPart);
                     }
                 }
@@ -358,7 +393,14 @@ class ChatCompletionsConverter extends FormatConverter {
 
         this._applyThinkingConfig(generationConfig, thinkingConfig, modelThinkingLevel);
 
-        googleRequest.generationConfig = generationConfig;
+        // Clean undefined keys
+        Object.keys(generationConfig).forEach(k => {
+            if (generationConfig[k] === undefined) delete generationConfig[k];
+        });
+
+        if (Object.keys(generationConfig).length > 0) {
+            googleRequest.generationConfig = generationConfig;
+        }
 
         // Convert OpenAI tools to Gemini functionDeclarations
         const openaiTools = openaiBody.tools || openaiBody.functions;
@@ -590,6 +632,15 @@ class ChatCompletionsConverter extends FormatConverter {
                             ? funcCall.id
                             : `call_${this._generateRequestId()}`;
 
+                    const sig = part.thoughtSignature || part.signature;
+                    if (sig) {
+                        const fallbackKey = `${funcCall.name}:${JSON.stringify(funcCall.args || {})}`;
+                        FormatConverter.recordToolSignature(toolCallId, sig, fallbackKey);
+                        if (funcCall.id) {
+                            FormatConverter.recordToolSignature(funcCall.id, sig);
+                        }
+                    }
+
                     // Track tool call index for multiple function calls
                     const toolCallIndex = streamState.toolCallIndex ?? 0;
                     streamState.toolCallIndex = toolCallIndex + 1;
@@ -602,6 +653,7 @@ class ChatCompletionsConverter extends FormatConverter {
                         id: toolCallId,
                         index: toolCallIndex,
                         type: "function",
+                        ...(sig ? { signature: sig, thoughtSignature: sig } : {}),
                     };
 
                     delta.tool_calls = [toolCallObj];
@@ -735,6 +787,15 @@ class ChatCompletionsConverter extends FormatConverter {
                             ? funcCall.id
                             : `call_${this._generateRequestId()}`;
 
+                    const sig = part.thoughtSignature || part.signature;
+                    if (sig) {
+                        const fallbackKey = `${funcCall.name}:${JSON.stringify(funcCall.args || {})}`;
+                        FormatConverter.recordToolSignature(toolCallId, sig, fallbackKey);
+                        if (funcCall.id) {
+                            FormatConverter.recordToolSignature(funcCall.id, sig);
+                        }
+                    }
+
                     const toolCallObj = {
                         function: {
                             arguments: JSON.stringify(funcCall.args || {}),
@@ -743,6 +804,7 @@ class ChatCompletionsConverter extends FormatConverter {
                         id: toolCallId,
                         index: tool_calls.length,
                         type: "function",
+                        ...(sig ? { signature: sig, thoughtSignature: sig } : {}),
                     };
                     tool_calls.push(toolCallObj);
                     this.logger.info(`[Adapter] Converted Gemini functionCall to OpenAI tool_calls: ${funcCall.name}`);

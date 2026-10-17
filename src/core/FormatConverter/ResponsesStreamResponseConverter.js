@@ -6,6 +6,7 @@
  */
 
 const ResponsesNonStreamResponseConverter = require("./ResponsesNonStreamResponseConverter");
+const FormatConverter = require("./CommonConverter");
 
 class ResponsesStreamResponseConverter extends ResponsesNonStreamResponseConverter {
     /**
@@ -724,6 +725,14 @@ class ResponsesStreamResponseConverter extends ResponsesNonStreamResponseConvert
                             typeof funcCall.id === "string" && funcCall.id
                                 ? funcCall.id
                                 : `call_${this._generateRequestId()}`;
+                        const sig = part.thoughtSignature || part.signature;
+                        if (sig) {
+                            const fallbackKey = `${funcCall.name}:${JSON.stringify(funcCall.args || {})}`;
+                            FormatConverter.recordToolSignature(callId, sig, fallbackKey);
+                            if (funcCall.id) {
+                                FormatConverter.recordToolSignature(funcCall.id, sig);
+                            }
+                        }
                         const args = isCustom ? funcCall.args?.input : JSON.stringify(funcCall.args || {});
                         if (typeof args !== "string") {
                             this.logger.warn(

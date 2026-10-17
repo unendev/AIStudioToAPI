@@ -17,6 +17,46 @@ class FormatConverter {
 
     // Placeholder signature for Gemini 3 functionCall validation
     static DUMMY_THOUGHT_SIGNATURE = "context_engineering_is_the_way_to_go";
+
+    // In-memory cache for tool call thoughtSignatures across conversation turns
+    static toolSignatureCache = new Map();
+    static MAX_TOOL_SIGNATURE_CACHE_SIZE = 2000;
+
+    /**
+     * Record a tool call thoughtSignature in cache
+     * @param {string} id - Tool call ID
+     * @param {string} signature - Gemini thoughtSignature
+     * @param {string} [fallbackKey] - Optional fallback key (e.g. name:args)
+     */
+    static recordToolSignature(id, signature, fallbackKey = null) {
+        if (!signature || typeof signature !== "string") return;
+        if (FormatConverter.toolSignatureCache.size >= FormatConverter.MAX_TOOL_SIGNATURE_CACHE_SIZE) {
+            const firstKey = FormatConverter.toolSignatureCache.keys().next().value;
+            FormatConverter.toolSignatureCache.delete(firstKey);
+        }
+        if (id) {
+            FormatConverter.toolSignatureCache.set(String(id), signature);
+        }
+        if (fallbackKey) {
+            FormatConverter.toolSignatureCache.set(String(fallbackKey), signature);
+        }
+    }
+
+    /**
+     * Retrieve a cached tool call thoughtSignature
+     * @param {string} id - Tool call ID
+     * @param {string} [fallbackKey] - Optional fallback key (e.g. name:args)
+     * @returns {string|null} - Cached signature or null
+     */
+    static getToolSignature(id, fallbackKey = null) {
+        if (id && FormatConverter.toolSignatureCache.has(String(id))) {
+            return FormatConverter.toolSignatureCache.get(String(id));
+        }
+        if (fallbackKey && FormatConverter.toolSignatureCache.has(String(fallbackKey))) {
+            return FormatConverter.toolSignatureCache.get(String(fallbackKey));
+        }
+        return null;
+    }
     static GEMINI_BUILT_IN_TOOL_KEYS = [
         "codeExecution",
         "code_execution",
@@ -213,8 +253,20 @@ class FormatConverter {
             );
         }
 
+        const MODEL_ALIASES = {
+            auto: "gemini-flash-latest",
+            "gemini-3.5-flash": "gemini-flash-latest",
+            "gemini-3.5-pro": "gemini-pro-latest",
+            "gemini-3.8-flash": "gemini-flash-latest",
+            "gemini-3.8-pro": "gemini-pro-latest",
+        };
+        const resolvedModelName = MODEL_ALIASES[cleanModelName] || cleanModelName;
+        if (resolvedModelName !== cleanModelName) {
+            this.logger.info(`${logPrefix} Model alias normalized: "${cleanModelName}" -> "${resolvedModelName}"`);
+        }
+
         return {
-            cleanModelName,
+            cleanModelName: resolvedModelName,
             forceCodeExecution,
             forceWebSearch,
             streamingMode,
@@ -280,7 +332,12 @@ class FormatConverter {
     }
 
     getDefaultSafetySettings() {
-        const threshold = this.serverSystem.config.safetySettingsThreshold || "OFF";
+        let threshold = this.serverSystem?.config?.safetySettingsThreshold || "BLOCK_ONLY_HIGH";
+        if (threshold === "OFF" || threshold === "BLOCK_NONE") {
+            // Google Generative Language API rejects BLOCK_NONE and OFF with 400 INVALID_ARGUMENT
+            // on standard/free accounts. BLOCK_ONLY_HIGH is the least restrictive threshold universally permitted.
+            threshold = "BLOCK_ONLY_HIGH";
+        }
         return [
             { category: "HARM_CATEGORY_HARASSMENT", threshold },
             { category: "HARM_CATEGORY_HATE_SPEECH", threshold },
@@ -379,11 +436,11 @@ class FormatConverter {
     }
 
     /**
-     * Ensure thoughtSignature is present in Gemini native format requests
-     * This handles direct Gemini API calls where functionCall may lack thoughtSignature
-     * Note: Only functionCall needs thoughtSignature, functionResponse does NOT need it
+     * Ensure thoughtSignature is present in Gemini native format requests.
+     * For historical functionCalls lacking a valid signature, degrade them and their
+     * matching functionResponses to conversational text context to avoid Google 400 rejection.
      * @param {object} geminiBody - Gemini API request body
-     * @returns {object} - Modified request body with thoughtSignature placeholders
+     * @returns {object} - Modified request body
      */
     ensureThoughtSignature(geminiBody) {
         if (!geminiBody || !geminiBody.contents || !Array.isArray(geminiBody.contents)) {
@@ -391,24 +448,53 @@ class FormatConverter {
         }
 
         const DUMMY_SIGNATURE = FormatConverter.DUMMY_THOUGHT_SIGNATURE;
+        const degradedToolNames = new Set();
 
         for (const content of geminiBody.contents) {
             if (!content.parts || !Array.isArray(content.parts)) continue;
 
-            // Only add signature to functionCall, not functionResponse
-            let signatureAdded = false;
-            for (const part of content.parts) {
-                // Check for functionCall without thoughtSignature
-                if (part.functionCall && !part.thoughtSignature) {
-                    if (!signatureAdded) {
-                        part.thoughtSignature = DUMMY_SIGNATURE;
-                        signatureAdded = true;
-                        this.logger.debug(
-                            `[Adapter] Added dummy thoughtSignature for functionCall: ${part.functionCall.name}`
+            for (let i = 0; i < content.parts.length; i++) {
+                const part = content.parts[i];
+                if (part.functionCall) {
+                    if (!part.thoughtSignature) {
+                        const fallbackKey = `${part.functionCall.name}:${JSON.stringify(part.functionCall.args || {})}`;
+                        const cachedSig = FormatConverter.getToolSignature(part.functionCall.id, fallbackKey);
+                        if (cachedSig) {
+                            part.thoughtSignature = cachedSig;
+                            this.logger.debug(
+                                `[Adapter] Restored cached thoughtSignature for functionCall: ${part.functionCall.name}`
+                            );
+                        } else {
+                            // Uncached historical tool call without thoughtSignature: degrade to text
+                            this.logger.warn(
+                                `[Adapter] Native Gemini functionCall "${part.functionCall.name}" has no thoughtSignature and none cached. Degrading to text context.`
+                            );
+                            const callName = part.functionCall.name;
+                            const callId = part.functionCall.id;
+                            if (callName) degradedToolNames.add(callName);
+                            if (callId) degradedToolNames.add(callId);
+                            content.parts[i] = {
+                                text: `[Tool Call: ${callName}(${JSON.stringify(part.functionCall.args || {})})]`,
+                            };
+                            continue;
+                        }
+                    }
+                    // Strip dummy/placeholder signatures to prevent Google API 400 INVALID_ARGUMENT rejection
+                    if (part.thoughtSignature === DUMMY_SIGNATURE) {
+                        delete part.thoughtSignature;
+                    }
+                } else if (part.functionResponse) {
+                    const respName = part.functionResponse.name;
+                    const respId = part.functionResponse.id;
+                    if ((respName && degradedToolNames.has(respName)) || (respId && degradedToolNames.has(respId))) {
+                        this.logger.warn(
+                            `[Adapter] Native Gemini functionResponse "${respName}" matches degraded functionCall. Degrading to text context.`
                         );
+                        content.parts[i] = {
+                            text: `[Tool Result for ${respName}: ${JSON.stringify(part.functionResponse.response || {})}]`,
+                        };
                     }
                 }
-                // Note: functionResponse does NOT need thoughtSignature per official docs
             }
         }
 
@@ -645,10 +731,176 @@ class FormatConverter {
 
         this.ensureServerSideToolInvocations(googleRequest);
 
-        // Safety settings
-        googleRequest.safetySettings = this.getDefaultSafetySettings();
+        // Normalize contents for alternating turns, non-empty parts, and valid start/end roles
+        this.normalizeGoogleContents(googleRequest);
+
+        // Ensure all tools referenced in conversation history are declared
+        this.ensureFunctionDeclarationsForContents(googleRequest);
+
+        // Safety settings: do not inject default safetySettings unless explicitly requested and not OFF/BLOCK_NONE,
+        // because Google Generative Language API on standard/free accounts rejects BLOCK_NONE/OFF with 400 INVALID_ARGUMENT.
+        const configuredThreshold = this.serverSystem?.config?.safetySettingsThreshold;
+        if (configuredThreshold && configuredThreshold !== "OFF" && configuredThreshold !== "BLOCK_NONE") {
+            googleRequest.safetySettings = this.getDefaultSafetySettings();
+        }
 
         this.logger.debug(`[Adapter] Debug: Final Gemini Request = ${JSON.stringify(googleRequest, null, 2)}`);
+    }
+
+    /**
+     * Normalize Gemini request contents to ensure strict Google API compliance:
+     * 1. Merges consecutive turns with the same role into a single turn (prevents "multiturn talk must alternate" 400 error).
+     * 2. Filters out empty parts/turns.
+     * 3. Ensures conversation starts with role: "user".
+     * 4. Ensures conversation ends with role: "user" (e.g. if ending with model/prefill, adds continuation user turn).
+     *
+     * @param {object} googleRequest - Gemini request object
+     */
+    normalizeGoogleContents(googleRequest) {
+        if (!googleRequest || !Array.isArray(googleRequest.contents) || googleRequest.contents.length === 0) {
+            return;
+        }
+
+        const rawContents = googleRequest.contents;
+        const normalized = [];
+
+        for (const item of rawContents) {
+            if (!item || typeof item !== "object") continue;
+            const role = item.role || "user";
+            const rawParts = Array.isArray(item.parts) ? item.parts : [];
+
+            // Clean parts: filter null/undefined and empty text parts
+            const cleanedParts = [];
+            for (const part of rawParts) {
+                if (!part || typeof part !== "object") continue;
+                // Skip empty text parts if there are other fields or if text is empty
+                if (typeof part.text === "string" && part.text.length === 0) {
+                    continue;
+                }
+                cleanedParts.push(part);
+            }
+
+            if (cleanedParts.length === 0) {
+                // If a turn had only empty text, keep a single whitespace part to avoid empty turn if necessary
+                if (rawParts.some(p => typeof p?.text === "string")) {
+                    cleanedParts.push({ text: " " });
+                } else {
+                    continue;
+                }
+            }
+
+            if (normalized.length > 0 && normalized[normalized.length - 1].role === role) {
+                // Merge consecutive same-role turns into the previous turn
+                normalized[normalized.length - 1].parts.push(...cleanedParts);
+            } else {
+                normalized.push({
+                    parts: cleanedParts,
+                    role,
+                });
+            }
+        }
+
+        // If normalized is empty after filtering, ensure at least one valid user message
+        if (normalized.length === 0) {
+            normalized.push({
+                parts: [{ text: "Hello" }],
+                role: "user",
+            });
+        }
+
+        // Gemini API constraint: First message must be "user"
+        if (normalized[0].role !== "user") {
+            normalized.unshift({
+                parts: [{ text: "Hello" }],
+                role: "user",
+            });
+        }
+
+        // Gemini API constraint: Last message must be "user"
+        // In Claude API, assistant prefill ends the messages array with role: "assistant".
+        // Gemini expects the model to generate the next response, so input must end with "user".
+        if (normalized[normalized.length - 1].role !== "user") {
+            normalized.push({
+                parts: [{ text: "Please continue and complete the response." }],
+                role: "user",
+            });
+        }
+
+        googleRequest.contents = normalized;
+    }
+
+    /**
+     * Ensures all function calls and responses referenced in contents are declared in tools.
+     * Prevents Gemini 400 INVALID_ARGUMENT ("functionCall/functionResponse is not declared in tools").
+     *
+     * @param {object} googleRequest - Gemini request object
+     */
+    ensureFunctionDeclarationsForContents(googleRequest) {
+        if (!googleRequest || !Array.isArray(googleRequest.contents)) {
+            return;
+        }
+
+        // Find all function names referenced in contents
+        const referencedFunctionNames = new Set();
+        for (const item of googleRequest.contents) {
+            if (!item || !Array.isArray(item.parts)) continue;
+            for (const part of item.parts) {
+                if (part?.functionCall?.name) {
+                    referencedFunctionNames.add(part.functionCall.name);
+                }
+                if (part?.functionResponse?.name) {
+                    referencedFunctionNames.add(part.functionResponse.name);
+                }
+            }
+        }
+
+        if (referencedFunctionNames.size === 0) {
+            return;
+        }
+
+        // Collect existing function declaration names
+        const existingFunctionNames = new Set();
+        if (Array.isArray(googleRequest.tools)) {
+            for (const tool of googleRequest.tools) {
+                const declarations = tool.functionDeclarations || tool.function_declarations;
+                if (Array.isArray(declarations)) {
+                    for (const decl of declarations) {
+                        if (decl?.name) existingFunctionNames.add(decl.name);
+                    }
+                }
+            }
+        }
+
+        // Find missing functions
+        const missingNames = [];
+        for (const name of referencedFunctionNames) {
+            if (!existingFunctionNames.has(name)) {
+                missingNames.push(name);
+            }
+        }
+
+        if (missingNames.length > 0) {
+            if (!Array.isArray(googleRequest.tools)) {
+                googleRequest.tools = [];
+            }
+            let funcTool = googleRequest.tools.find(t => Array.isArray(t.functionDeclarations));
+            if (!funcTool) {
+                funcTool = { functionDeclarations: [] };
+                googleRequest.tools.unshift(funcTool);
+            }
+
+            for (const name of missingNames) {
+                funcTool.functionDeclarations.push({
+                    description: "Auto-declared tool placeholder for historical conversation context",
+                    name,
+                    parametersJsonSchema: {
+                        properties: {},
+                        type: "object",
+                    },
+                });
+                this.logger.info(`[Adapter] Injected missing tool declaration placeholder for: ${name}`);
+            }
+        }
     }
 
     /**
